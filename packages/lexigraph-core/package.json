@@ -13,10 +13,12 @@
   },
   "files": [
     "dist",
+    "grammars",
     "README.md"
   ],
   "scripts": {
     "build": "tsup",
+    "sync-grammars": "node scripts/sync-grammars.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
@@ -26,6 +28,7 @@
     "web-tree-sitter": "^0.25.0"
   },
   "devDependencies": {
-    "fast-check": "^3.23.2"
+    "fast-check": "^3.23.2",
+    "tree-sitter-wasms": "0.1.13"
   }
 }

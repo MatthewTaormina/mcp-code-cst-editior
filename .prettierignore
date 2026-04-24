@@ -5,3 +5,7 @@ target/**
 _tmp_workspaces/**
 *.wasm
 pnpm-lock.yaml
+
+# Corpus files are byte-exact round-trip fixtures — never reformat.
+packages/lexigraph-core/tests/corpus/**
+packages/lexigraph-core/grammars/**

@@ -45,6 +45,9 @@ importers:
       fast-check:
         specifier: ^3.23.2
         version: 3.23.2
+      tree-sitter-wasms:
+        specifier: 0.1.13
+        version: 0.1.13
 
   packages/lexigraph-mcp:
     dependencies:
@@ -1517,6 +1520,9 @@ packages:
   tree-kill@1.2.2:
     resolution: {integrity: sha512-L0Orpi8qGpRG//Nd+H90vFB+3iHnue1zSSGmNOOCh1GLJ7rUKVwV2HvijphGQS2UmhUZewS9VgvxYIdgr+fG1A==}
     hasBin: true
+
+  tree-sitter-wasms@0.1.13:
+    resolution: {integrity: sha512-wT+cR6DwaIz80/vho3AvSF0N4txuNx/5bcRKoXouOfClpxh/qqrF4URNLQXbbt8MaAxeksZcZd1j8gcGjc+QxQ==}
 
   ts-api-utils@2.5.0:
     resolution: {integrity: sha512-OJ/ibxhPlqrMM0UiNHJ/0CKQkoKF243/AEmplt3qpRgkW8VG7IfOS41h7V8TjITqdByHzrjcS/2si+y4lIh8NA==}
@@ -2997,6 +3003,8 @@ snapshots:
   toidentifier@1.0.1: {}
 
   tree-kill@1.2.2: {}
+
+  tree-sitter-wasms@0.1.13: {}
 
   ts-api-utils@2.5.0(typescript@5.9.3):
     dependencies:

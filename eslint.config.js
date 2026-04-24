@@ -11,6 +11,8 @@ export default [
       'target/**',
       '_tmp_workspaces/**',
       '**/*.wasm',
+      'packages/lexigraph-core/tests/corpus/**',
+      'packages/lexigraph-core/grammars/**',
     ],
   },
   {
