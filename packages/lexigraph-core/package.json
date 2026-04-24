@@ -1,0 +1,31 @@
+{
+  "name": "@lexigraph/core",
+  "version": "0.0.0",
+  "description": "Tree-sitter CST primitive: parse, query, and patch source files losslessly",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "clean": "rimraf dist"
+  },
+  "dependencies": {
+    "web-tree-sitter": "^0.25.0"
+  },
+  "devDependencies": {
+    "fast-check": "^3.23.2"
+  }
+}

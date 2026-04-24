@@ -1,0 +1,7 @@
+**/dist/**
+**/node_modules/**
+legacy/**
+target/**
+_tmp_workspaces/**
+*.wasm
+pnpm-lock.yaml
