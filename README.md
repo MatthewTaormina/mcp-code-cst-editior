@@ -14,9 +14,12 @@ carries a version counter so the server can detect and reject stale edits.
 | Capability | Description |
 |---|---|
 | **Line-level editing** | Read and replace individual lines while preserving all other content verbatim (lossless round-trip) |
+| **Structural mutations** | Insert and delete lines using rowan's native `splice_children` — no re-parse of unchanged nodes |
 | **Token-level inspection** | Rust files (`.rs`) are lexed into semantic tokens — Keywords, Identifiers, Literals, Comments, Whitespace, Punctuation — visible at the sub-line level |
 | **Conflict detection** | Optimistic locking via `expected_version` guards against clobbering watcher-triggered reloads |
 | **Auto-reload** | inotify-backed watcher detects external changes and reloads tracked files without dropping sessions |
+| **Workspace confinement** | `--workspace-path` is required at startup; all paths are resolved relative to the workspace root and escape attempts (`../../`) are rejected |
+| **JSON ruleset** | Optional `--ruleset-path` points to a policy document that controls access by action, resource glob, and priority |
 | **MCP stdio transport** | Works out-of-the-box with Claude Desktop, Claude Code, and any MCP-compliant client |
 
 ---
@@ -50,6 +53,120 @@ This writes `/etc/sysctl.d/99-cst-mcp-inotify.conf` (persists across reboots).
 
 ---
 
+## Startup
+
+`--workspace-path` is **required**.  All paths supplied to any tool are
+resolved against this root.  Paths that escape the workspace (e.g. via `../`)
+are rejected with an `"error:"` response.
+
+```bash
+# Minimal — default-allow everything inside the workspace
+cst-mcp-server --workspace-path /home/alice/myproject
+
+# With a ruleset that further restricts access
+cst-mcp-server --workspace-path /home/alice/myproject \
+               --ruleset-path  /home/alice/myproject/.cst-rules.json
+```
+
+### Path format
+
+All paths may use Unix-style forward slashes on every platform.  On Windows
+the prefix `/c/` is converted to `C:\` automatically, so callers always send
+Unix paths regardless of the host OS.
+
+| Client sends | Resolved on Windows | Resolved on Linux/macOS |
+|---|---|---|
+| `/home/alice/src/main.rs` | (unchanged, treated as absolute) | `/home/alice/src/main.rs` |
+| `/c/Users/alice/src/main.rs` | `C:\Users\alice\src\main.rs` | `/c/Users/alice/src/main.rs` |
+| `src/main.rs` | `<workspace>\src\main.rs` | `<workspace>/src/main.rs` |
+
+---
+
+## JSON Ruleset
+
+The optional `--ruleset-path` file controls fine-grained access with ordered
+allow/deny rules.  Rules are relative to the workspace root unless the
+resource pattern starts with `/` (absolute).
+
+### Schema
+
+```json
+{
+  "rules": [
+    {
+      "effect":   "deny" | "allow",
+      "priority": <integer — higher wins>,
+      "actions":  ["track" | "untrack" | "load" | "read" | "edit" | "insert" | "delete" | "save" | "*"],
+      "resources": ["<glob-pattern>" | ...]
+    }
+  ]
+}
+```
+
+### Action names
+
+| Action | Triggered by |
+|---|---|
+| `track` | `track_file` |
+| `untrack` | `untrack_file` |
+| `load` | `load_file` |
+| `read` | `get_node`, `get_tree_skeleton`, `get_line_tokens` |
+| `edit` | `edit_node` |
+| `insert` | `insert_lines` |
+| `delete` | `delete_lines` |
+| `save` | `save_file` |
+| `*` | any action |
+
+### Resource glob patterns
+
+| Pattern | Matches |
+|---|---|
+| `src/*.rs` | All `.rs` files directly in `src/` |
+| `src/**/*.rs` | All `.rs` files anywhere under `src/` |
+| `*.lock` | All `.lock` files in the workspace root |
+| `**` | Every file in the workspace |
+| `/etc/**` | Absolute pattern — every file under `/etc/` |
+
+### Rule evaluation
+
+1. Rules are sorted by **descending priority** (highest number wins).
+2. The **first matching** rule (action + resource) determines the outcome.
+3. If no rule matches, the default is **allow** (the workspace-containment
+   check is the primary security boundary).
+4. When two rules have equal priority, **deny** wins.
+
+### Examples
+
+```json
+{
+  "rules": [
+    {
+      "comment": "Protect lockfiles from any modification",
+      "effect": "deny",
+      "priority": 200,
+      "actions": ["edit", "insert", "delete", "save"],
+      "resources": ["*.lock", "**/Cargo.lock"]
+    },
+    {
+      "comment": "Allow read access to the entire workspace",
+      "effect": "allow",
+      "priority": 50,
+      "actions": ["read", "load", "track"],
+      "resources": ["**"]
+    },
+    {
+      "comment": "Deny all by default (lower priority — override above)",
+      "effect": "deny",
+      "priority": 10,
+      "actions": ["*"],
+      "resources": ["**"]
+    }
+  ]
+}
+```
+
+---
+
 ## Claude Desktop configuration
 
 Add the server to `~/Library/Application Support/Claude/claude_desktop_config.json`
@@ -59,7 +176,8 @@ Add the server to `~/Library/Application Support/Claude/claude_desktop_config.js
 {
   "mcpServers": {
     "cst-editor": {
-      "command": "/absolute/path/to/cst-mcp-server"
+      "command": "/absolute/path/to/cst-mcp-server",
+      "args": ["--workspace-path", "/home/alice/myproject"]
     }
   }
 }
@@ -311,8 +429,9 @@ Flush the in-memory CST back to disk (lossless round-trip).
 ## Architecture
 
 ```
-main.rs          — tokio entry point; wires state + watcher + MCP stdio
+main.rs          — tokio entry point; parses --workspace-path / --ruleset-path; wires access + state + watcher + MCP stdio
 src/
+  access.rs      — AccessConfig: workspace confinement, JSON ruleset loading, glob-based rule evaluation
   cst.rs         — rowan CST (CstFile, NodeInfo, TokenInfo, FileLanguage)
   lexer.rs       — lossless Rust token lexer; plain-text fallback
   state.rs       — ServerState: versioned HashMap<PathBuf, CstFile>

@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use rmcp::{
@@ -7,6 +6,7 @@ use rmcp::{
 use serde::Deserialize;
 use tokio::sync::RwLock;
 
+use crate::access::AccessConfig;
 use crate::cst::CstFile;
 use crate::state::ServerState;
 use crate::watcher::{watch_path, unwatch_path, WatcherHandle};
@@ -130,11 +130,20 @@ pub struct SaveParams {
 pub struct CstMcpServer {
     state: Arc<RwLock<ServerState>>,
     watcher: WatcherHandle,
+    access: Arc<AccessConfig>,
 }
 
 impl CstMcpServer {
-    pub fn new(state: Arc<RwLock<ServerState>>, watcher: WatcherHandle) -> Self {
-        Self { state, watcher }
+    pub fn new(
+        state: Arc<RwLock<ServerState>>,
+        watcher: WatcherHandle,
+        access: Arc<AccessConfig>,
+    ) -> Self {
+        Self {
+            state,
+            watcher,
+            access,
+        }
     }
 }
 
@@ -151,7 +160,10 @@ impl CstMcpServer {
         &self,
         Parameters(TrackParams { path }): Parameters<TrackParams>,
     ) -> String {
-        let path = PathBuf::from(&path);
+        let path = match self.access.resolve_and_check("track", &path) {
+            Err(e) => return format!("error: {e}"),
+            Ok(p) => p,
+        };
 
         match std::fs::read_to_string(&path) {
             Err(e) => format!("error: could not read {path:?}: {e}"),
@@ -176,7 +188,10 @@ impl CstMcpServer {
         &self,
         Parameters(UntrackParams { path }): Parameters<UntrackParams>,
     ) -> String {
-        let path = PathBuf::from(&path);
+        let path = match self.access.resolve_and_check("untrack", &path) {
+            Err(e) => return format!("error: {e}"),
+            Ok(p) => p,
+        };
         let removed = self.state.write().await.untrack(&path);
 
         if removed {
@@ -199,7 +214,10 @@ impl CstMcpServer {
         &self,
         Parameters(LoadParams { path }): Parameters<LoadParams>,
     ) -> String {
-        let path = PathBuf::from(&path);
+        let path = match self.access.resolve_and_check("load", &path) {
+            Err(e) => return format!("error: {e}"),
+            Ok(p) => p,
+        };
         let state = self.state.read().await;
 
         match state.get(&path) {
@@ -229,7 +247,10 @@ impl CstMcpServer {
         &self,
         Parameters(GetNodeParams { path, node_id }): Parameters<GetNodeParams>,
     ) -> String {
-        let path = PathBuf::from(&path);
+        let path = match self.access.resolve_and_check("read", &path) {
+            Err(e) => return format!("error: {e}"),
+            Ok(p) => p,
+        };
         let state = self.state.read().await;
 
         match state.get(&path) {
@@ -265,7 +286,10 @@ impl CstMcpServer {
         &self,
         Parameters(SkeletonParams { path }): Parameters<SkeletonParams>,
     ) -> String {
-        let path = PathBuf::from(&path);
+        let path = match self.access.resolve_and_check("read", &path) {
+            Err(e) => return format!("error: {e}"),
+            Ok(p) => p,
+        };
         let state = self.state.read().await;
 
         match state.get(&path) {
@@ -318,7 +342,10 @@ impl CstMcpServer {
             expected_version,
         }): Parameters<EditParams>,
     ) -> String {
-        let path = PathBuf::from(&path);
+        let path = match self.access.resolve_and_check("edit", &path) {
+            Err(e) => return format!("error: {e}"),
+            Ok(p) => p,
+        };
 
         // Build the new CST outside of the write lock to minimise hold time.
         let new_file = {
@@ -401,7 +428,10 @@ impl CstMcpServer {
         &self,
         Parameters(GetLineTokensParams { path, node_id }): Parameters<GetLineTokensParams>,
     ) -> String {
-        let path = PathBuf::from(&path);
+        let path = match self.access.resolve_and_check("read", &path) {
+            Err(e) => return format!("error: {e}"),
+            Ok(p) => p,
+        };
         let state = self.state.read().await;
 
         match state.get(&path) {
@@ -444,7 +474,10 @@ impl CstMcpServer {
         &self,
         Parameters(SaveParams { path }): Parameters<SaveParams>,
     ) -> String {
-        let path = PathBuf::from(&path);
+        let path = match self.access.resolve_and_check("save", &path) {
+            Err(e) => return format!("error: {e}"),
+            Ok(p) => p,
+        };
         let state = self.state.read().await;
 
         match state.get(&path) {
@@ -490,7 +523,10 @@ impl CstMcpServer {
             expected_version,
         }): Parameters<InsertLinesParams>,
     ) -> String {
-        let path = PathBuf::from(&path);
+        let path = match self.access.resolve_and_check("insert", &path) {
+            Err(e) => return format!("error: {e}"),
+            Ok(p) => p,
+        };
 
         let new_file = {
             let state = self.state.read().await;
@@ -557,7 +593,10 @@ impl CstMcpServer {
             expected_version,
         }): Parameters<DeleteLinesParams>,
     ) -> String {
-        let path = PathBuf::from(&path);
+        let path = match self.access.resolve_and_check("delete", &path) {
+            Err(e) => return format!("error: {e}"),
+            Ok(p) => p,
+        };
 
         let new_file = {
             let state = self.state.read().await;
