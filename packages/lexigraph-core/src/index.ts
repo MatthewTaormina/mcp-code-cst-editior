@@ -17,4 +17,7 @@ export { encodeToken, decodeToken, parsePointer, buildPointer, childPointer } fr
 export { executeQuery, QueryCompileError } from './query.js';
 export type { QueryCapture, QueryMatch, QueryOptions, QueryResult } from './query.js';
 
+export { applyPatch } from './patch.js';
+export type { PatchOp, PatchResult, ApplyPatchOptions } from './patch.js';
+
 export const VERSION = '0.0.0';
