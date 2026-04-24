@@ -34,11 +34,15 @@ impl ServerState {
         self.files.contains_key(path)
     }
 
-    /// Snapshot of all currently tracked paths (used by the watcher on startup
-    /// and future tooling that needs to enumerate tracked files).
-    #[allow(dead_code)]
+    /// Sorted snapshot of all currently tracked paths.
+    ///
+    /// Sorted lexicographically so that `list_tracked_files` responses are
+    /// deterministic across invocations regardless of `HashMap` iteration
+    /// order.
     pub fn tracked_paths(&self) -> Vec<PathBuf> {
-        self.files.keys().cloned().collect()
+        let mut paths: Vec<PathBuf> = self.files.keys().cloned().collect();
+        paths.sort();
+        paths
     }
 }
 

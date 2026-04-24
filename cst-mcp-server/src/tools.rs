@@ -70,6 +70,19 @@ pub struct EditParams {
     pub expected_version: Option<u64>,
 }
 
+/// Parameters for `get_line_tokens`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetLineTokensParams {
+    /// Absolute path of the tracked file.
+    pub path: String,
+    /// 0-based line index of the node whose tokens should be returned.
+    pub node_id: u32,
+}
+
+/// Parameters for `list_tracked_files` (no fields — lists all tracked paths).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListTrackedFilesParams {}
+
 /// Parameters for `save_file`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SaveParams {
@@ -307,6 +320,87 @@ impl CstMcpServer {
                 self.state.write().await.track(path.clone(), new_file);
                 format!("ok: node {node_id} in {path:?} updated (CST version {version})")
             }
+        }
+    }
+
+    /// Return a sorted list of every file currently held in memory.
+    ///
+    /// The response is a JSON object with a `count` field and a `files` array
+    /// of absolute path strings.  Use this to check which files are available
+    /// for inspection or editing without making a separate `load_file` call
+    /// for each candidate.
+    #[tool(
+        description = "List all files currently tracked in memory. \
+                        Returns JSON: {count, files: [sorted absolute paths]}."
+    )]
+    async fn list_tracked_files(
+        &self,
+        Parameters(ListTrackedFilesParams {}): Parameters<ListTrackedFilesParams>,
+    ) -> String {
+        let state = self.state.read().await;
+        let files: Vec<String> = state
+            .tracked_paths()
+            .into_iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+
+        serde_json::json!({
+            "count": files.len(),
+            "files": files,
+        })
+        .to_string()
+    }
+
+    /// Return the token-level children of a single Line node.
+    ///
+    /// For `.rs` files, each token carries a semantic `kind` — one of
+    /// `"Keyword"`, `"Identifier"`, `"Literal"`, `"Comment"`,
+    /// `"Whitespace"`, `"Newline"`, or `"Punctuation"`.  For all other file
+    /// types each line contains a single `"Text"` token (the same as the
+    /// plain-text grammar used before language-specific lexing was added).
+    ///
+    /// Use `get_tree_skeleton` to discover valid `node_id` values, then call
+    /// this tool to inspect sub-line token structure.
+    #[tool(
+        description = "Get the token-level children of a Line node in the CST. \
+                        Returns JSON: {line_node_id, language, tokens: [{token_idx, kind, text, span}], version}. \
+                        Kind values for .rs files: Keyword | Identifier | Literal | Comment | Whitespace | Newline | Punctuation."
+    )]
+    async fn get_line_tokens(
+        &self,
+        Parameters(GetLineTokensParams { path, node_id }): Parameters<GetLineTokensParams>,
+    ) -> String {
+        let path = PathBuf::from(&path);
+        let state = self.state.read().await;
+
+        match state.get(&path) {
+            None => format!("error: {path:?} is not tracked — call track_file first"),
+            Some(file) => match file.get_line_tokens(node_id) {
+                Err(e) => format!("error: {e}"),
+                Ok(tokens) => {
+                    let version = file.version;
+                    let lang = format!("{:?}", file.language());
+                    let token_values: Vec<_> = tokens
+                        .iter()
+                        .map(|t| {
+                            serde_json::json!({
+                                "token_idx": t.token_idx,
+                                "kind": t.kind,
+                                "text": t.text,
+                                "span": { "start": t.span_start, "end": t.span_end },
+                            })
+                        })
+                        .collect();
+
+                    serde_json::json!({
+                        "line_node_id": node_id,
+                        "language": lang,
+                        "tokens": token_values,
+                        "version": version,
+                    })
+                    .to_string()
+                }
+            },
         }
     }
 

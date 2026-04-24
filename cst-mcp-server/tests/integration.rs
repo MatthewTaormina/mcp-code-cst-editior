@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cst_mcp_server::{
-    cst::CstFile,
+    cst::{CstFile, FileLanguage},
     state::ServerState,
     watcher::{start_watcher, watch_path},
 };
@@ -239,3 +239,175 @@ async fn watcher_increments_version_monotonically() {
     let v = state.read().await.get(&path).unwrap().version;
     assert!(v >= 2, "version should be at least 2 after two reloads; got {v}");
 }
+
+// ---------------------------------------------------------------------------
+// Phase 3: Language-specific lexer (Rust token-level grammar)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rust_file_gets_rust_language() {
+    let file = CstFile::parse(PathBuf::from("src/lib.rs"), "fn f() {}\n");
+    assert_eq!(file.language(), FileLanguage::Rust);
+}
+
+#[test]
+fn non_rust_file_gets_plain_language() {
+    for ext in &["txt", "py", "md", "toml", "json"] {
+        let path = PathBuf::from(format!("file.{ext}"));
+        let file = CstFile::parse(path.clone(), "hello\n");
+        assert_eq!(
+            file.language(),
+            FileLanguage::Plain,
+            ".{ext} should use Plain language"
+        );
+    }
+}
+
+#[test]
+fn rust_lexer_emits_keyword_tokens() {
+    let src = "pub fn hello() -> bool {\n    true\n}\n";
+    let file = CstFile::parse(PathBuf::from("a.rs"), src);
+
+    let tokens_line0 = file.get_line_tokens(0).unwrap();
+    let kinds: Vec<&str> = tokens_line0.iter().map(|t| t.kind).collect();
+    assert!(kinds.contains(&"Keyword"), "line 0 should contain a Keyword token");
+
+    let keywords: Vec<&str> = tokens_line0
+        .iter()
+        .filter(|t| t.kind == "Keyword")
+        .map(|t| t.text.as_str())
+        .collect();
+    assert!(keywords.contains(&"pub"), "expected 'pub' keyword");
+    assert!(keywords.contains(&"fn"), "expected 'fn' keyword");
+}
+
+#[test]
+fn rust_lexer_lossless_per_line() {
+    let src = "fn main() {\n    let x = 42;\n    println!(\"{x}\");\n}\n";
+    let file = CstFile::parse(PathBuf::from("b.rs"), src);
+    let node_count = file.tree_skeleton().len();
+
+    for i in 0..node_count as u32 {
+        let line_info = file.get_node(i).unwrap();
+        let tokens = file.get_line_tokens(i).unwrap();
+        let reconstructed: String = tokens.iter().map(|t| t.text.as_str()).collect();
+        assert_eq!(
+            reconstructed, line_info.text,
+            "line {i} token reconstruction must be lossless"
+        );
+    }
+}
+
+#[test]
+fn rust_lexer_comment_token() {
+    let src = "// this is a comment\nfn f() {}\n";
+    let file = CstFile::parse(PathBuf::from("c.rs"), src);
+    let tokens = file.get_line_tokens(0).unwrap();
+    assert!(
+        tokens.iter().any(|t| t.kind == "Comment"),
+        "line 0 should be a Comment token"
+    );
+}
+
+#[test]
+fn rust_lexer_string_literal_token() {
+    let src = "let s = \"hello world\";\n";
+    let file = CstFile::parse(PathBuf::from("d.rs"), src);
+    let tokens = file.get_line_tokens(0).unwrap();
+    assert!(
+        tokens.iter().any(|t| t.kind == "Literal" && t.text.contains("hello")),
+        "should contain a Literal token for the string"
+    );
+}
+
+#[test]
+fn get_line_tokens_span_continuity() {
+    let src = "fn foo(x: u32) -> u32 { x + 1 }\n";
+    let file = CstFile::parse(PathBuf::from("e.rs"), src);
+    let tokens = file.get_line_tokens(0).unwrap();
+
+    // Spans must be contiguous: each token starts where the previous ended.
+    for window in tokens.windows(2) {
+        assert_eq!(
+            window[0].span_end, window[1].span_start,
+            "token spans must be contiguous"
+        );
+    }
+}
+
+#[test]
+fn plain_lexer_preserves_full_line_text() {
+    let src = "hello world: some=random, text!\n";
+    let file = CstFile::parse(PathBuf::from("notes.txt"), src);
+    let tokens = file.get_line_tokens(0).unwrap();
+    let reconstructed: String = tokens.iter().map(|t| t.text.as_str()).collect();
+    assert_eq!(reconstructed, src);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: list_tracked_files via ServerState
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tracked_paths_is_sorted() {
+    let mut state = ServerState::new();
+    let paths = [
+        PathBuf::from("/z/file.rs"),
+        PathBuf::from("/a/file.rs"),
+        PathBuf::from("/m/file.rs"),
+    ];
+    for p in &paths {
+        state.track(p.clone(), CstFile::parse(p.clone(), "x\n"));
+    }
+
+    let tracked = state.tracked_paths();
+    let mut expected = paths.to_vec();
+    expected.sort();
+    assert_eq!(tracked, expected, "tracked_paths() must return sorted paths");
+}
+
+#[test]
+fn tracked_paths_empty_when_none_tracked() {
+    let state = ServerState::new();
+    assert!(state.tracked_paths().is_empty());
+}
+
+#[test]
+fn tracked_paths_updates_after_untrack() {
+    let mut state = ServerState::new();
+    let p1 = PathBuf::from("/a.rs");
+    let p2 = PathBuf::from("/b.rs");
+    state.track(p1.clone(), CstFile::parse(p1.clone(), "x\n"));
+    state.track(p2.clone(), CstFile::parse(p2.clone(), "y\n"));
+
+    state.untrack(&p1);
+    let tracked = state.tracked_paths();
+    assert_eq!(tracked, vec![p2]);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: replace_node preserves language-specific lexing
+// ---------------------------------------------------------------------------
+
+#[test]
+fn edit_preserves_rust_token_structure() {
+    let src = "fn main() {\n    let x = 1;\n}\n";
+    let file = CstFile::parse(PathBuf::from("f.rs"), src);
+
+    let edited = file.replace_node(1, "    let y = 2;").unwrap();
+
+    // The edited file should still use the Rust lexer.
+    assert_eq!(edited.language(), FileLanguage::Rust);
+
+    // The edited line should contain a Keyword token for "let".
+    let tokens = edited.get_line_tokens(1).unwrap();
+    assert!(
+        tokens.iter().any(|t| t.kind == "Keyword" && t.text == "let"),
+        "edited line should contain 'let' keyword token"
+    );
+
+    // Unedited lines must be unchanged.
+    assert_eq!(edited.get_node(0).unwrap().text, "fn main() {\n");
+    assert_eq!(edited.get_node(2).unwrap().text, "}\n");
+}
+
