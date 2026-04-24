@@ -1,5 +1,5 @@
 {
   "extends": "./tsconfig.base.json",
   "files": [],
-  "references": [{ "path": "./packages/lexigraph-core" }, { "path": "./packages/lexigraph-mcp" }]
+  "include": []
 }
