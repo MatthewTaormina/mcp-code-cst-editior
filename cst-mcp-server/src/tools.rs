@@ -36,6 +36,22 @@ pub struct LoadParams {
     pub path: String,
 }
 
+/// Parameters for `get_node`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetNodeParams {
+    /// Absolute path of the tracked file.
+    pub path: String,
+    /// 0-based line index of the node to retrieve.
+    pub node_id: u32,
+}
+
+/// Parameters for `get_tree_skeleton`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SkeletonParams {
+    /// Absolute path of the tracked file to inspect.
+    pub path: String,
+}
+
 /// Parameters for `edit_node`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct EditParams {
@@ -46,6 +62,12 @@ pub struct EditParams {
     /// New text content for the target line (without a trailing newline;
     /// the server preserves the original line-ending).
     pub new_text: String,
+    /// If provided, the edit is only applied when the file's current CST
+    /// version matches this value.  Use this to detect conflicts: obtain the
+    /// version from a prior `load_file` or `get_node` call, and pass it here
+    /// so the server can reject the edit if the file was reloaded by the
+    /// watcher (or by another edit) in the meantime.
+    pub expected_version: Option<u64>,
 }
 
 /// Parameters for `save_file`.
@@ -149,13 +171,99 @@ impl CstMcpServer {
         }
     }
 
+    /// Return full metadata for a single CST node (line).
+    ///
+    /// The response is a JSON object with the node's `node_id`, `kind`,
+    /// full `text` (including any trailing newline), byte `span` offsets,
+    /// and the file's current `version`.  Use the `version` field with
+    /// `edit_node`'s `expected_version` parameter to detect edit conflicts.
+    #[tool(
+        description = "Get the text content, kind, and byte-span of a single line node in the CST. \
+                        Returns JSON. Use the returned version with edit_node to avoid conflicts."
+    )]
+    async fn get_node(
+        &self,
+        Parameters(GetNodeParams { path, node_id }): Parameters<GetNodeParams>,
+    ) -> String {
+        let path = PathBuf::from(&path);
+        let state = self.state.read().await;
+
+        match state.get(&path) {
+            None => format!("error: {path:?} is not tracked — call track_file first"),
+            Some(file) => match file.get_node(node_id) {
+                Err(e) => format!("error: {e}"),
+                Ok(info) => {
+                    let version = file.version;
+                    serde_json::json!({
+                        "node_id": info.node_id,
+                        "kind": info.kind,
+                        "text": info.text,
+                        "span": { "start": info.span_start, "end": info.span_end },
+                        "version": version,
+                    })
+                    .to_string()
+                }
+            },
+        }
+    }
+
+    /// Return a structural listing of all line nodes in a tracked file's CST.
+    ///
+    /// The response is a JSON array, one object per line, each containing
+    /// `node_id`, `kind`, `text_preview` (truncated), byte `span`, and the
+    /// file's current `version`.  Use this to navigate the file before
+    /// calling `get_node` or `edit_node`.
+    #[tool(
+        description = "List all CST line nodes with their IDs, spans, and text previews. \
+                        Returns a JSON array. Use node_id values with get_node or edit_node."
+    )]
+    async fn get_tree_skeleton(
+        &self,
+        Parameters(SkeletonParams { path }): Parameters<SkeletonParams>,
+    ) -> String {
+        let path = PathBuf::from(&path);
+        let state = self.state.read().await;
+
+        match state.get(&path) {
+            None => format!("error: {path:?} is not tracked — call track_file first"),
+            Some(file) => {
+                let version = file.version;
+                let nodes: Vec<_> = file
+                    .tree_skeleton()
+                    .into_iter()
+                    .map(|info| {
+                        serde_json::json!({
+                            "node_id": info.node_id,
+                            "kind": info.kind,
+                            "text_preview": info.text_preview(),
+                            "span": { "start": info.span_start, "end": info.span_end },
+                        })
+                    })
+                    .collect();
+
+                serde_json::json!({
+                    "version": version,
+                    "nodes": nodes,
+                })
+                .to_string()
+            }
+        }
+    }
+
     /// Replace the content of one line (identified by its 0-based `node_id`)
     /// inside a tracked file's in-memory CST.
     ///
     /// All other lines — including their whitespace and comments — are
     /// preserved verbatim (lossless round-trip via rowan).
+    ///
+    /// If `expected_version` is supplied, the edit is rejected with a
+    /// `"conflict"` response when the file's actual version differs.  This
+    /// protects against clobbering a watcher-triggered reload that happened
+    /// between your `load_file`/`get_node` call and this `edit_node` call.
     #[tool(
-        description = "Edit a single line node in the CST of a tracked file. All other lines are preserved verbatim."
+        description = "Edit a single line node in the CST of a tracked file. All other lines are \
+                        preserved verbatim.  Pass expected_version (from get_node or load_file) to \
+                        guard against concurrent external file changes."
     )]
     async fn edit_node(
         &self,
@@ -163,6 +271,7 @@ impl CstMcpServer {
             path,
             node_id,
             new_text,
+            expected_version,
         }): Parameters<EditParams>,
     ) -> String {
         let path = PathBuf::from(&path);
@@ -172,7 +281,22 @@ impl CstMcpServer {
             let state = self.state.read().await;
             match state.get(&path) {
                 None => return format!("error: {path:?} is not tracked — call track_file first"),
-                Some(file) => file.replace_node(node_id, &new_text),
+                Some(file) => {
+                    // Version conflict detection: if the caller supplied an
+                    // expected_version and it doesn't match the actual version,
+                    // the file was modified (by the watcher or another edit)
+                    // since the caller last read it.
+                    if let Some(expected) = expected_version {
+                        if file.version != expected {
+                            return format!(
+                                "conflict: {path:?} is at version {} but expected version {} — \
+                                 re-read the file with load_file or get_node and retry",
+                                file.version, expected
+                            );
+                        }
+                    }
+                    file.replace_node(node_id, &new_text)
+                }
             }
         };
 

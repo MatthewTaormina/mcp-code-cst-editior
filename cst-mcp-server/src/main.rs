@@ -1,16 +1,8 @@
-mod cst;
-mod state;
-mod tools;
-mod watcher;
-
 use anyhow::Result;
+use cst_mcp_server::{state::ServerState, tools::CstMcpServer, watcher::start_watcher};
 use rmcp::{ServiceExt, transport::stdio};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-
-use crate::state::ServerState;
-use crate::tools::CstMcpServer;
-use crate::watcher::start_watcher;
 
 #[tokio::main]
 async fn main() -> Result<()> {
