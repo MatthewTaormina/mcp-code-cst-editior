@@ -24,6 +24,10 @@ pub enum FileLanguage {
     Tsx,
     Css,
     Html,
+    /// JSON — parsed with tree-sitter-json.
+    Json,
+    /// Markdown — parsed with tree-sitter-md.
+    Markdown,
     /// No recognised grammar — file is stored verbatim without a parse tree.
     Plain,
 }
@@ -37,6 +41,8 @@ impl FileLanguage {
             Some("tsx") => FileLanguage::Tsx,
             Some("css") | Some("scss") | Some("sass") | Some("less") => FileLanguage::Css,
             Some("html") | Some("htm") | Some("svg") => FileLanguage::Html,
+            Some("json") | Some("jsonc") => FileLanguage::Json,
+            Some("md") | Some("markdown") | Some("mdx") => FileLanguage::Markdown,
             _ => FileLanguage::Plain,
         }
     }
@@ -52,6 +58,8 @@ impl FileLanguage {
             FileLanguage::Tsx => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
             FileLanguage::Css => Some(tree_sitter_css::LANGUAGE.into()),
             FileLanguage::Html => Some(tree_sitter_html::LANGUAGE.into()),
+            FileLanguage::Json => Some(tree_sitter_json::LANGUAGE.into()),
+            FileLanguage::Markdown => Some(tree_sitter_md::LANGUAGE.into()),
             FileLanguage::Plain => None,
         }
     }
@@ -484,6 +492,126 @@ impl CstFile {
             }
         }
     }
+    // -----------------------------------------------------------------------
+    // Plain-text line operations
+    // -----------------------------------------------------------------------
+    /// Return lines (1-based) as a JSON value.  Works for any file.
+    ///
+    /// `start` and `end` are inclusive, 1-based line numbers.  Omit both to
+    /// get the entire file.
+    pub fn get_lines(
+        &self,
+        start: Option<usize>,
+        end: Option<usize>,
+    ) -> serde_json::Value {
+        let all: Vec<&str> = self.source.lines().collect();
+        let total = all.len();
+        let s = start.unwrap_or(1).max(1);
+        let e = end.unwrap_or(total).min(total);
+        let lines: Vec<serde_json::Value> = (s..=e)
+            .filter_map(|i| all.get(i - 1).map(|l| serde_json::json!({"line": i, "text": l})))
+            .collect();
+        serde_json::json!({
+            "total_lines": total,
+            "start": s,
+            "end": e,
+            "lines": lines,
+        })
+    }
+
+    /// Replace the content of line `line_num` (1-based) with `new_text`.
+    ///
+    /// Only valid for `Plain` files — use `edit_node` for parsed languages.
+    pub fn edit_line(
+        &self,
+        line_num: usize,
+        new_text: &str,
+        expected_version: Option<u64>,
+    ) -> anyhow::Result<CstFile> {
+        self.check_version(expected_version)?;
+        anyhow::ensure!(
+            self.language == FileLanguage::Plain,
+            "edit_line is only valid for plain-text files; use edit_node for {:?}",
+            self.language
+        );
+        let mut lines: Vec<&str> = self.source.lines().collect();
+        let total = lines.len();
+        anyhow::ensure!(
+            line_num >= 1 && line_num <= total,
+            "line {} out of range (file has {} line{})",
+            line_num, total, if total == 1 { "" } else { "s" }
+        );
+        lines[line_num - 1] = new_text;
+        let mut new_source = lines.join("\n");
+        if self.source.ends_with('\n') {
+            new_source.push('\n');
+        }
+        Ok(Self::parse_with_version(self.path.clone(), &new_source, self.version + 1))
+    }
+
+    /// Insert `text` as a new line before or after `line_num` (1-based).
+    ///
+    /// Only valid for `Plain` files.
+    pub fn insert_line(
+        &self,
+        line_num: usize,
+        text: &str,
+        after: bool,
+        expected_version: Option<u64>,
+    ) -> anyhow::Result<CstFile> {
+        self.check_version(expected_version)?;
+        anyhow::ensure!(
+            self.language == FileLanguage::Plain,
+            "insert_line is only valid for plain-text files; use insert_before/insert_after for {:?}",
+            self.language
+        );
+        let mut lines: Vec<&str> = self.source.lines().collect();
+        let total = lines.len();
+        // Allow line_num == total + 1 when inserting after last line.
+        let max = if after { total + 1 } else { total };
+        anyhow::ensure!(
+            line_num >= 1 && line_num <= max,
+            "line {} out of range (file has {} line{})",
+            line_num, total, if total == 1 { "" } else { "s" }
+        );
+        let insert_idx = if after { line_num } else { line_num - 1 };
+        lines.insert(insert_idx, text);
+        let mut new_source = lines.join("\n");
+        if self.source.ends_with('\n') {
+            new_source.push('\n');
+        }
+        Ok(Self::parse_with_version(self.path.clone(), &new_source, self.version + 1))
+    }
+
+    /// Delete line `line_num` (1-based).
+    ///
+    /// Only valid for `Plain` files.
+    pub fn delete_line(
+        &self,
+        line_num: usize,
+        expected_version: Option<u64>,
+    ) -> anyhow::Result<CstFile> {
+        self.check_version(expected_version)?;
+        anyhow::ensure!(
+            self.language == FileLanguage::Plain,
+            "delete_line is only valid for plain-text files; use delete_node for {:?}",
+            self.language
+        );
+        let mut lines: Vec<&str> = self.source.lines().collect();
+        let total = lines.len();
+        anyhow::ensure!(
+            line_num >= 1 && line_num <= total,
+            "line {} out of range (file has {} line{})",
+            line_num, total, if total == 1 { "" } else { "s" }
+        );
+        lines.remove(line_num - 1);
+        let mut new_source = lines.join("\n");
+        if !new_source.is_empty() && self.source.ends_with('\n') {
+            new_source.push('\n');
+        }
+        Ok(Self::parse_with_version(self.path.clone(), &new_source, self.version + 1))
+    }
+
     // -----------------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------------

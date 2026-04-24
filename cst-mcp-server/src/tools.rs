@@ -122,6 +122,41 @@ pub struct QueryWorkspaceParams {
 pub struct QueryToolParams {
     pub tool_name: Option<String>,
 }
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetLinesParams {
+    pub path: String,
+    /// First line to return, 1-based (default 1).
+    pub start: Option<usize>,
+    /// Last line to return, 1-based inclusive (default: last line).
+    pub end: Option<usize>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct EditLineParams {
+    pub path: String,
+    /// 1-based line number to replace.
+    pub line: usize,
+    /// Replacement text for the line (no trailing newline needed).
+    pub new_text: String,
+    pub expected_version: Option<u64>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct InsertLineParams {
+    pub path: String,
+    /// 1-based reference line number.
+    pub line: usize,
+    /// Text for the new line.
+    pub text: String,
+    /// Insert after the reference line (`true`) or before it (`false`, default).
+    pub after: Option<bool>,
+    pub expected_version: Option<u64>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DeleteLineParams {
+    pub path: String,
+    /// 1-based line number to remove.
+    pub line: usize,
+    pub expected_version: Option<u64>,
+}
 // ---------------------------------------------------------------------------
 // Server struct
 // ---------------------------------------------------------------------------
@@ -696,6 +731,109 @@ impl CstMcpServer {
             "results": results,
         }).to_string()
     }
+    // --- Plain-text line tools ---
+    /// Read lines from any tracked file with 1-based line numbers.
+    ///
+    /// Works for all file types but is the primary navigation tool for
+    /// `Plain` files (`.txt`, `.env`, `.toml`, etc.) that have no parse tree.
+    #[tool(
+        description = "Read lines from a tracked file with 1-based line numbers. \
+                        Provide start/end to slice; omit both for the whole file. \
+                        Returns JSON {total_lines, start, end, lines:[{line, text}]}. \
+                        Use for plain-text files that have no CST."
+    )]
+    async fn get_lines(
+        &self,
+        Parameters(GetLinesParams { path, start, end }): Parameters<GetLinesParams>,
+    ) -> String {
+        let path = match self.access.resolve_and_check("read", &path) {
+            Err(e) => return format!("error: {e}"),
+            Ok(p) => p,
+        };
+        let state = self.state.read().await;
+        match state.get(&path) {
+            None => format!("error: {path:?} is not tracked — call track_file first"),
+            Some(file) => {
+                let mut result = file.get_lines(start, end);
+                result["version"] = serde_json::json!(file.version);
+                result["language"] = serde_json::json!(format!("{:?}", file.language()));
+                result.to_string()
+            }
+        }
+    }
+
+    /// Replace the content of a single line in a plain-text file.
+    #[tool(
+        description = "Replace a single line (1-based) in a plain-text file. \
+                        Only valid for Plain files — use edit_node for JSON, Markdown, and code files. \
+                        Returns JSON {version} or an error string."
+    )]
+    async fn edit_line(
+        &self,
+        Parameters(EditLineParams { path, line, new_text, expected_version }): Parameters<EditLineParams>,
+    ) -> String {
+        let path = match self.access.resolve_and_check("edit", &path) {
+            Err(e) => return format!("error: {e}"),
+            Ok(p) => p,
+        };
+        let new_file = {
+            let state = self.state.read().await;
+            match state.get(&path) {
+                None => return format!("error: {path:?} is not tracked — call track_file first"),
+                Some(file) => file.edit_line(line, &new_text, expected_version),
+            }
+        };
+        self.apply_plain_edit(path, new_file).await
+    }
+
+    /// Insert a new line before or after a reference line in a plain-text file.
+    #[tool(
+        description = "Insert a new line before (default) or after a reference line (1-based) in a plain-text file. \
+                        Only valid for Plain files — use insert_before/insert_after for parsed languages. \
+                        Returns JSON {version} or an error string."
+    )]
+    async fn insert_line(
+        &self,
+        Parameters(InsertLineParams { path, line, text, after, expected_version }): Parameters<InsertLineParams>,
+    ) -> String {
+        let path = match self.access.resolve_and_check("edit", &path) {
+            Err(e) => return format!("error: {e}"),
+            Ok(p) => p,
+        };
+        let new_file = {
+            let state = self.state.read().await;
+            match state.get(&path) {
+                None => return format!("error: {path:?} is not tracked — call track_file first"),
+                Some(file) => file.insert_line(line, &text, after.unwrap_or(false), expected_version),
+            }
+        };
+        self.apply_plain_edit(path, new_file).await
+    }
+
+    /// Delete a single line from a plain-text file.
+    #[tool(
+        description = "Delete a line (1-based) from a plain-text file. \
+                        Only valid for Plain files — use delete_node for parsed languages. \
+                        Returns JSON {version} or an error string."
+    )]
+    async fn delete_line(
+        &self,
+        Parameters(DeleteLineParams { path, line, expected_version }): Parameters<DeleteLineParams>,
+    ) -> String {
+        let path = match self.access.resolve_and_check("edit", &path) {
+            Err(e) => return format!("error: {e}"),
+            Ok(p) => p,
+        };
+        let new_file = {
+            let state = self.state.read().await;
+            match state.get(&path) {
+                None => return format!("error: {path:?} is not tracked — call track_file first"),
+                Some(file) => file.delete_line(line, expected_version),
+            }
+        };
+        self.apply_plain_edit(path, new_file).await
+    }
+
     // --- Help ---
     #[tool(
         description = "Get documentation and selection guidance. Omit tool_name for the full \
@@ -755,6 +893,25 @@ impl CstMcpServer {
             }
         }
     }
+
+    /// Plain-text edits don't have CST errors — just store the new file.
+    async fn apply_plain_edit(
+        &self,
+        path: std::path::PathBuf,
+        result: anyhow::Result<CstFile>,
+    ) -> String {
+        match result {
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("conflict") { msg } else { format!("error: {msg}") }
+            }
+            Ok(new_file) => {
+                let version = new_file.version;
+                self.state.write().await.track(path, new_file);
+                serde_json::json!({ "version": version }).to_string()
+            }
+        }
+    }
 }
 // ---------------------------------------------------------------------------
 // Static tool catalog used by query_tool
@@ -774,31 +931,40 @@ TRACKING — before reading or editing a file you must track it:\
 \n  7. get_tree_skeleton → hierarchical JSON view of the parse tree (start at root or node_id)\
 \n  8. get_node          → metadata for one node: kind, row/col, byte offsets, child count\
 \n  9. get_children      → direct children of a node with field names (name, body, params…)\
+\n 10. get_lines         → read lines with 1-based numbers (all files; required for Plain)\
 \
 \nQUERY — find nodes using tree-sitter s-expression syntax:\
-\n 10. query_file        → pattern match in one file, returns captured nodes\
-\n 11. query_workspace   → same query across all tracked files\
+\n 11. query_file        → pattern match in one file, returns captured nodes\
+\n 12. query_workspace   → same query across all tracked files\
 \n     Example: (function_item name: (identifier) @fn_name)\
 \
-\nEDITING — mutate the in-memory CST (always pass expected_version to guard conflicts):\
-\n 12. edit_node         → replace a node's entire source span\
-\n 13. insert_before     → insert text immediately before a node\
-\n 14. insert_after      → insert text immediately after a node\
-\n 15. insert_into       → insert text inside a node (at start or end of its span)\
-\n 16. delete_node       → delete a node's source span entirely\
-\n 17. save_file         → flush in-memory CST back to disk\
+\nEDITING — CST node edits (Rust/JS/TS/CSS/HTML/JSON/Markdown; always pass expected_version):\
+\n 13. edit_node         → replace a node's entire source span\
+\n 14. insert_before     → insert text immediately before a node\
+\n 15. insert_after      → insert text immediately after a node\
+\n 16. insert_into       → insert text inside a node (at start or end of its span)\
+\n 17. delete_node       → delete a node's source span entirely\
+\n 18. save_file         → flush in-memory CST back to disk\
+\
+\nPLAIN-TEXT LINE EDITS (only for Plain files — .txt, .env, etc.):\
+\n 19. edit_line         → replace a single line (1-based)\
+\n 20. insert_line       → insert a new line before/after a reference line\
+\n 21. delete_line       → delete a line\
+\
+\nPARSED LANGUAGES: Rust .rs | JS .js/.jsx | TS .ts | TSX .tsx\
+\n  CSS .css/.scss | HTML .html | JSON .json/.jsonc | Markdown .md/.markdown\
+\n  Everything else is Plain — use line tools.\
 \
 \nHELP:\
-\n 18. query_tool        → this tool; docs for any tool or the full catalog\
+\n 22. query_tool        → this tool; docs for any tool or the full catalog\
 \
-\nTYPICAL WORKFLOW:\
-\n  track_file\
-\n  → get_tree_skeleton            (understand structure)\
-\n  → get_children(fn_node_id)     (find the body block)\
-\n  → insert_into(body_id, text)   (add a statement)\
-\n  → save_file\
+\nTYPICAL WORKFLOW (parsed file):\
+\n  track_file → get_tree_skeleton → get_children → edit_node/insert_into → save_file\
 \
-\nAFTER EVERY EDIT: Node IDs are stale. Re-query with get_tree_skeleton or get_children.";
+\nTYPICAL WORKFLOW (plain text):\
+\n  track_file → get_lines → edit_line/insert_line/delete_line → save_file\
+\
+\nAFTER EVERY CST EDIT: Node IDs are stale. Re-query with get_tree_skeleton or get_children.";
 fn tool_catalog() -> Vec<serde_json::Value> {
     vec![
         serde_json::json!({"name":"track_file","category":"tracking","description":"Load file into memory as a tree-sitter CST and watch for external changes."}),
@@ -818,6 +984,10 @@ fn tool_catalog() -> Vec<serde_json::Value> {
         serde_json::json!({"name":"insert_into","category":"editing","description":"Insert text inside a node at its start or end (position='start'|'end', default 'end'). Good for adding statements to a block body.","params":["path","node_id","text","position?","expected_version?"]}),
         serde_json::json!({"name":"delete_node","category":"editing","description":"Delete a node's entire source span.","params":["path","node_id","expected_version?"]}),
         serde_json::json!({"name":"save_file","category":"editing","description":"Flush in-memory CST to disk.","params":["path"]}),
+        serde_json::json!({"name":"get_lines","category":"plain_text","description":"Read lines with 1-based numbers. Works for all files; required for Plain files with no CST.","params":["path","start?","end?"]}),
+        serde_json::json!({"name":"edit_line","category":"plain_text","description":"Replace a single line (1-based) in a Plain file.","params":["path","line","new_text","expected_version?"]}),
+        serde_json::json!({"name":"insert_line","category":"plain_text","description":"Insert a new line before (default) or after a reference line in a Plain file.","params":["path","line","text","after?","expected_version?"]}),
+        serde_json::json!({"name":"delete_line","category":"plain_text","description":"Delete a line (1-based) from a Plain file.","params":["path","line","expected_version?"]}),
         serde_json::json!({"name":"query_tool","category":"help","description":"Get docs for any tool or the full catalog with selection guide.","params":["tool_name?"]}),
     ]
 }
