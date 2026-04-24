@@ -1,0 +1,19 @@
+# TOML with comments, tables, arrays of tables, and inline tables.
+title = "demo" # inline comment
+
+[package]
+name = "lexigraph"
+version = "0.0.0"
+authors = ["You <you@example.com>"]
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] } # inline table
+chokidar = "4"
+
+[[workers]]
+id = 1
+role = "primary"
+
+[[workers]]
+id = 2
+role = "secondary"

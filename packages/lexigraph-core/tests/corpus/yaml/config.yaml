@@ -1,0 +1,26 @@
+# YAML with comments, anchors, and various scalar styles.
+name: lexigraph # project name
+version: 0.0.0
+description: |
+  A multi-line
+  literal block scalar
+  with preserved newlines.
+
+defaults: &defaults
+  timeout: 30
+  retries: 3
+
+services:
+  - name: web
+    <<: *defaults
+    port: 8080
+  - name: api # api service
+    <<: *defaults
+    port: 8081
+
+flow:
+  short: "quoted with: colon"
+  folded: >
+    Folded block
+    scalar collapses
+    newlines.

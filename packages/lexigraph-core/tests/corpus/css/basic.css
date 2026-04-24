@@ -1,0 +1,15 @@
+/* simple stylesheet */
+:root {
+  --primary: #3366ff;
+  --gap: 8px;
+}
+
+body {
+  margin: 0;
+  font-family: system-ui, sans-serif;
+}
+
+.button {
+  background: var(--primary);
+  padding: var(--gap) calc(var(--gap) * 2);
+}

@@ -1,0 +1,14 @@
+{
+   "deeply" :     {
+      "nested"   :   {
+         "obj":     {
+            "a"  :  [
+               1 ,  2  ,3,4 ,
+               { "x" :    "y"  ,  "z"  : null  } ,
+               [ true ,  false ,    null  ]
+            ]
+         }
+      }
+   }   ,
+   "trailing whitespace key  ":    "value with    spaces"
+}

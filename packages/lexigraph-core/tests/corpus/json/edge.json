@@ -1,0 +1,6 @@
+{
+  "unicode": "héllo \u00e9 \"escaped\" \\ \n \t",
+  "empty_obj": {},
+  "empty_arr": [],
+  "numbers": [0, -0, 1, -1, 1.5, -1.5e10, 0.1e-5]
+}

@@ -1,0 +1,13 @@
+multi = """
+multiline
+basic string
+"""
+
+literal = '''
+literal
+multiline
+'''
+
+dates = { date = 2024-01-02, time = 10:30:00, datetime = 2024-01-02T10:30:00Z }
+
+numbers = [0, +1, -1, 3.14, 1e10, 0xff, 0o755, 0b1010]

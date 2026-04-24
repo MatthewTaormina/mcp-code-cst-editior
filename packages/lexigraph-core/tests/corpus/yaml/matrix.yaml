@@ -1,0 +1,16 @@
+matrix:
+  - {os: linux, node: 20}
+  - {os: linux, node: 22}
+  - {os: macos, node: 20}
+nested:
+  a:
+    b:
+      c:
+        d: leaf
+list_of_lists:
+  -
+    - 1
+    - 2
+  -
+    - 3
+    - 4
