@@ -14,4 +14,7 @@ export type { LxNode, LxPosition, LxRange } from './node.js';
 
 export { encodeToken, decodeToken, parsePointer, buildPointer, childPointer } from './pointer.js';
 
+export { executeQuery, QueryCompileError } from './query.js';
+export type { QueryCapture, QueryMatch, QueryOptions, QueryResult } from './query.js';
+
 export const VERSION = '0.0.0';

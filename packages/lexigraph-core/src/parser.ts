@@ -38,6 +38,13 @@ async function loadLanguage(def: LanguageDef): Promise<Language> {
   return p;
 }
 
+/** Internal: load (and cache) the native tree-sitter Language for a registered language. */
+export async function loadLanguageById(id: LanguageId): Promise<Language> {
+  const def = LANGUAGES[id];
+  if (!def) throw new Error(`lexigraph: unknown language id: ${String(id)}`);
+  return loadLanguage(def);
+}
+
 async function getParser(def: LanguageDef): Promise<Parser> {
   const cached = parserCache.get(def.id);
   if (cached) return cached;
