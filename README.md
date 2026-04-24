@@ -115,6 +115,7 @@ resource pattern starts with `/` (absolute).
 | `insert` | `insert_lines` |
 | `delete` | `delete_lines` |
 | `save` | `save_file` |
+| `query` | `query_file` |
 | `*` | any action |
 
 ### Resource glob patterns
@@ -426,17 +427,158 @@ Flush the in-memory CST back to disk (lossless round-trip).
 
 ---
 
+### `query_file`
+
+Search the CST of a single tracked file using any combination of text
+filters, semantic patterns, identifier search, and scope-depth constraints.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `path` | `string` | ✓ | Path of the tracked file |
+| `query` | `QueryExpr` | ✓ | Query expression (see below) |
+
+#### QueryExpr fields
+
+| Field | Type | Description |
+|---|---|---|
+| `kind` | `string` | Filter by kind name (case-insensitive).  Line-depth: `"Line"`.  Token-depth (.rs): `Keyword` \| `Identifier` \| `Literal` \| `Comment` \| `Whitespace` \| `Punctuation` \| `Newline`. |
+| `text_contains` | `string` | Substring match (case-sensitive). |
+| `text_glob` | `string` | Glob pattern — `*` = any chars, `?` = one char (no path-separator semantics). |
+| `node_id_from` | `integer` | First line to consider (0-based, inclusive). |
+| `node_id_to` | `integer` | Last line to consider (0-based, inclusive). |
+| `depth` | `"line"` \| `"token"` | Match at line level (default) or token level.  Overridden by `semantic` / `identifier_name`. |
+| `semantic` | `string` | Named syntactic construct (see table below). Returns a `capture` per match. |
+| `identifier_name` | `string` | Find every token-level occurrence of this exact identifier. |
+| `scope_depth_min` | `integer` | Only lines where brace-nesting depth ≥ N (0 = top-level). |
+| `scope_depth_max` | `integer` | Only lines where brace-nesting depth ≤ N. |
+
+#### Semantic pattern values
+
+Scope depth is computed by counting `{` / `}` Punctuation tokens (never
+generated inside string literals or comments, so typically accurate).
+Multi-line string literals are a known limitation.
+
+| `semantic` value | Matches | `capture` |
+|---|---|---|
+| `fn_def` | `fn <name>(…)` | function name |
+| `struct_def` | `struct <name>` | struct name |
+| `enum_def` | `enum <name>` | enum name |
+| `trait_def` | `trait <name>` | trait name |
+| `impl_block` | `impl [Trait for] Type` | first identifier after `impl` |
+| `type_def` | `type <name> =` | alias name |
+| `variable_def` | `let [mut] <name>` / `const <name>` / `static [mut] <name>` | variable name |
+| `use_stmt` | `use <path>;` | the imported path |
+| `macro_call` | `<name>!(…)` | macro name |
+
+#### Examples
+
+```json
+// All top-level function definitions
+{"semantic": "fn_def", "scope_depth_max": 0}
+
+// Every occurrence of the identifier "conn"
+{"identifier_name": "conn"}
+
+// Lines containing "TODO" anywhere in the file
+{"text_contains": "TODO"}
+
+// All keyword tokens in the first 10 lines, token-depth
+{"depth": "token", "kind": "Keyword", "node_id_to": 9}
+
+// All variable definitions inside exactly one level of nesting
+{"semantic": "variable_def", "scope_depth_min": 1, "scope_depth_max": 1}
+```
+
+**Returns:** JSON
+
+```json
+{
+  "file": "/abs/path/src/main.rs",
+  "language": "Rust",
+  "version": 1,
+  "match_count": 2,
+  "matches": [
+    {
+      "node_id": 0,
+      "kind": "Line",
+      "text": "fn main() {\n",
+      "span_start": 0,
+      "span_end": 12,
+      "scope_depth": 0,
+      "capture": "main"
+    }
+  ]
+}
+```
+
+Token-depth matches also include `"token_idx"`.  Semantic matches include
+`"capture"`.  Both fields are omitted when not applicable.
+
+---
+
+### `query_workspace`
+
+Run the same `QueryExpr` across **all tracked files** simultaneously.  Files
+with zero matches are omitted from the output.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `query` | `QueryExpr` | ✓ | Same expression as `query_file` |
+| `graph` | `GraphQuery \| null` | — | **Reserved — pass `null` or omit.**  Future releases will use this field for cross-file relationship queries (import graphs, call graphs, reference chains). |
+
+**Returns:** JSON
+
+```json
+{
+  "total_files_searched": 3,
+  "files_with_matches": 1,
+  "total_matches": 4,
+  "results": [
+    {
+      "file": "/abs/path/src/main.rs",
+      "language": "Rust",
+      "version": 0,
+      "match_count": 4,
+      "matches": [ … ]
+    }
+  ]
+}
+```
+
+> **Planned:** The `graph` field will later accept a `GraphQuery` object to
+> express relationship-aware searches such as *"all files that import symbol X"*,
+> *"callers of function Y"*, or *"modules reachable from the entry point"*.  The
+> schema will be documented when the feature is implemented.
+
+---
+
+### `query_tool`
+
+Return documentation and tool-selection guidance for this server.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `tool_name` | `string` (optional) | Name of the tool to look up.  Omit for the full catalog + selection guide. |
+
+Omit `tool_name` to get a categorised tool catalog (tracking / inspection /
+query / editing / help) plus a typical workflow.  Provide a specific tool name
+to get focused parameter docs and examples.
+
+**Returns:** JSON catalog or single-tool entry.
+
+---
+
 ## Architecture
 
 ```
 main.rs          — tokio entry point; parses --workspace-path / --ruleset-path; wires access + state + watcher + MCP stdio
 src/
   access.rs      — AccessConfig: workspace confinement, JSON ruleset loading, glob-based rule evaluation
-  cst.rs         — rowan CST (CstFile, NodeInfo, TokenInfo, FileLanguage)
+  cst.rs         — rowan CST (CstFile, NodeInfo, TokenInfo, QueryExpr, QueryMatch, FileLanguage)
   lexer.rs       — lossless Rust token lexer; plain-text fallback
   state.rs       — ServerState: versioned HashMap<PathBuf, CstFile>
   watcher.rs     — notify watcher; auto-reloads tracked files on disk change
-  tools.rs       — 11 MCP tools exposed via #[tool_router(server_handler)]
+  tools.rs       — 14 MCP tools exposed via #[tool_router(server_handler)]
 tests/
   integration.rs — 29 integration tests (watcher, conflict, token-level, concurrent)
 scripts/
@@ -446,6 +588,6 @@ scripts/
 ## Testing
 
 ```bash
-cargo test          # run all 88 tests (unit + integration)
+cargo test          # run all 125 tests (unit + integration)
 cargo build         # verify binary compiles
 ```

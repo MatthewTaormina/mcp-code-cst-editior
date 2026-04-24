@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use rowan::{GreenNode, GreenNodeBuilder, GreenToken, Language, NodeOrToken, SyntaxNode};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::lexer::{self, TokenKind};
 
@@ -460,7 +460,469 @@ impl CstFile {
 }
 
 // ---------------------------------------------------------------------------
-// Internal builder
+// Query — structured search across the CST
+// ---------------------------------------------------------------------------
+
+/// A structured query expression that filters Line nodes or individual tokens.
+///
+/// All filter fields are optional.  An expression with no fields matches
+/// everything at the selected depth.  Multiple fields are AND-ed together.
+///
+/// ## Quick examples
+///
+/// All function definitions at the top level of a Rust file:
+/// `{"semantic":"fn_def","scope_depth_max":0}`
+///
+/// All uses of a specific identifier anywhere in the file:
+/// `{"identifier_name":"my_var"}`
+///
+/// Lines containing a TODO comment:
+/// `{"text_contains":"TODO"}`
+///
+/// All keyword tokens on lines 0–20:
+/// `{"depth":"token","kind":"Keyword","node_id_to":20}`
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct QueryExpr {
+    // ── text / kind filters ──────────────────────────────────────────────────
+
+    /// Filter by kind name (case-insensitive).
+    ///
+    /// At `depth="line"` the only valid value is `"Line"`.
+    /// At `depth="token"` valid values for Rust files are: `"Keyword"`,
+    /// `"Identifier"`, `"Literal"`, `"Comment"`, `"Whitespace"`,
+    /// `"Punctuation"`, `"Newline"`.  For plain files: `"Text"`.
+    pub kind: Option<String>,
+
+    /// Require the line/token text to contain this substring (case-sensitive).
+    pub text_contains: Option<String>,
+
+    /// Require the line/token text to match this glob pattern.
+    ///
+    /// `*` matches any sequence of characters (including none).
+    /// `?` matches exactly one character.
+    /// Neither metacharacter restricts path separators — this is text matching.
+    pub text_glob: Option<String>,
+
+    // ── line-range filter ────────────────────────────────────────────────────
+
+    /// Only consider lines whose 0-based `node_id` is ≥ this value.
+    pub node_id_from: Option<u32>,
+
+    /// Only consider lines whose 0-based `node_id` is ≤ this value (inclusive).
+    pub node_id_to: Option<u32>,
+
+    // ── depth ────────────────────────────────────────────────────────────────
+
+    /// The level at which to match: `"line"` (default) or `"token"`.
+    ///
+    /// `"line"` — each Line node is tested as a whole; results include the
+    /// full line text.
+    ///
+    /// `"token"` — each token inside every Line node is tested individually;
+    /// results include the token text and `token_idx`.
+    ///
+    /// Overridden to token-depth when `identifier_name` is set; overridden to
+    /// line-depth (with capture) when `semantic` is set.
+    pub depth: Option<String>,
+
+    // ── code-native (semantic) patterns ─────────────────────────────────────
+
+    /// Match lines that contain a specific syntactic construct (Rust files only).
+    ///
+    /// | Value | What it matches | `capture` field |
+    /// |---|---|---|
+    /// | `"fn_def"` | `fn <name>(…)` | function name |
+    /// | `"struct_def"` | `struct <name>` | struct name |
+    /// | `"enum_def"` | `enum <name>` | enum name |
+    /// | `"trait_def"` | `trait <name>` | trait name |
+    /// | `"impl_block"` | `impl [Trait for] Type` | first identifier after `impl` |
+    /// | `"type_def"` | `type <name> =` | alias name |
+    /// | `"variable_def"` | `let [mut] <name>` / `const <name>` / `static [mut] <name>` | variable name |
+    /// | `"use_stmt"` | `use <path>;` | the imported path |
+    /// | `"macro_call"` | `<name>!(…)` | macro name |
+    ///
+    /// This field implies line-depth output even when `depth="token"` is set.
+    /// Each matching line produces one result with a non-null `capture`.
+    /// Can be combined with `scope_depth_min`/`scope_depth_max` to restrict
+    /// to a particular nesting level (e.g. only top-level `fn` definitions).
+    pub semantic: Option<String>,
+
+    /// Find every occurrence of a specific identifier by exact name.
+    ///
+    /// Operates at token depth — each matching `Identifier` token becomes its
+    /// own result entry with a `token_idx`.  Can be combined with
+    /// `scope_depth_min`/`scope_depth_max` or `node_id_from`/`node_id_to` to
+    /// narrow the search to a particular scope or region of the file.
+    pub identifier_name: Option<String>,
+
+    // ── scope-depth filters ──────────────────────────────────────────────────
+
+    /// Only include results where the brace-nesting depth at the line's start
+    /// is ≥ this value.  Depth 0 = top-level code, 1 = inside one `{…}`
+    /// block, and so on.
+    ///
+    /// Depth is computed by counting `{` and `}` `Punctuation` tokens as we
+    /// scan the file.  Because punctuation tokens are never generated inside
+    /// string literals or comments (those are whole `Literal`/`Comment`
+    /// tokens), depth is accurate for typical Rust code.  Multi-line string
+    /// literals spanning more than one source line are a known limitation.
+    pub scope_depth_min: Option<u32>,
+
+    /// Only include results where the brace-nesting depth at the line's start
+    /// is ≤ this value.
+    pub scope_depth_max: Option<u32>,
+}
+
+/// A single item returned by [`CstFile::query`].
+#[derive(Debug, Clone, Serialize)]
+pub struct QueryMatch {
+    /// 0-based index of the Line node that produced this match.
+    pub node_id: u32,
+    /// Kind label: `"Line"` for line-depth matches, or a token kind name
+    /// (`"Keyword"`, `"Identifier"`, …) for token-depth matches.
+    pub kind: String,
+    /// Full text of the matched line or token (including any trailing `\n`).
+    pub text: String,
+    /// Byte offset of the first character within the file.
+    pub span_start: u32,
+    /// Byte offset one past the last character of this match.
+    pub span_end: u32,
+    /// For token-depth matches: 0-based index of the token within its Line.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_idx: Option<u32>,
+    /// For semantic pattern matches: the primary name extracted from the
+    /// matched construct (function name, variable name, import path, etc.).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture: Option<String>,
+    /// Heuristic brace-nesting depth at the start of this line.
+    /// 0 = top-level code, 1 = inside one `{…}` block, etc.
+    pub scope_depth: u32,
+}
+
+// ---------------------------------------------------------------------------
+// CstFile::query — extension impl
+// ---------------------------------------------------------------------------
+
+impl CstFile {
+    /// Run `expr` against this file's CST and return all matching items in
+    /// document order.
+    ///
+    /// See [`QueryExpr`] for the full description of each filter field.
+    /// Filters are applied in the following order:
+    ///
+    /// 1. `node_id_from` / `node_id_to` — skip lines outside the range.
+    /// 2. `scope_depth_min` / `scope_depth_max` — skip lines at the wrong
+    ///    brace-nesting depth.
+    /// 3. `semantic` (line-depth, returns capture) *or* `identifier_name`
+    ///    (token-depth, exact identifier) *or* generic `kind`/`text_*`/`depth`
+    ///    filters.
+    pub fn query(&self, expr: &QueryExpr) -> Vec<QueryMatch> {
+        let root = LangSyntaxNode::new_root(self.root.clone());
+        let mut results = Vec::new();
+        let mut depth: u32 = 0; // heuristic brace-nesting depth
+
+        let is_semantic = expr.semantic.is_some();
+        let is_ident = expr.identifier_name.is_some();
+        // token_level is true for generic token searches and for identifier_name;
+        // overridden by is_semantic (always line-level).
+        let token_level = !is_semantic
+            && (is_ident || expr.depth.as_deref() == Some("token"));
+
+        for (line_idx, line_node) in root.children().enumerate() {
+            let node_id = line_idx as u32;
+
+            // Collect (kind, text, span_start, span_end) for all tokens in
+            // this line.  Needed for semantic matching, scope updates, and
+            // token-level filtering.
+            let raw_tokens: Vec<(String, String, u32, u32)> = line_node
+                .children_with_tokens()
+                .filter_map(|elem| {
+                    if let NodeOrToken::Token(tok) = elem {
+                        let r = tok.text_range();
+                        Some((
+                            tok.kind().as_str().to_owned(),
+                            tok.text().to_owned(),
+                            u32::from(r.start()),
+                            u32::from(r.end()),
+                        ))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            // Record the depth at the START of this line, then advance depth
+            // by counting net `{`/`}` in the line's tokens.
+            let line_depth = depth;
+            for (kind, text, _, _) in &raw_tokens {
+                if kind == "Punctuation" {
+                    match text.as_str() {
+                        "{" => depth += 1,
+                        "}" => depth = depth.saturating_sub(1),
+                        _ => {}
+                    }
+                }
+            }
+
+            // ── node_id range ───────────────────────────────────────────────
+            if let Some(from) = expr.node_id_from {
+                if node_id < from {
+                    continue;
+                }
+            }
+            if let Some(to) = expr.node_id_to {
+                if node_id > to {
+                    break;
+                }
+            }
+
+            // ── scope-depth filter ──────────────────────────────────────────
+            if let Some(min) = expr.scope_depth_min {
+                if line_depth < min {
+                    continue;
+                }
+            }
+            if let Some(max) = expr.scope_depth_max {
+                if line_depth > max {
+                    continue;
+                }
+            }
+
+            // ── semantic pattern search (line-depth, produces capture) ───────
+            if is_semantic {
+                let pattern = expr.semantic.as_deref().unwrap();
+                if let Some(capture) =
+                    detect_semantic_pattern(&raw_tokens, pattern)
+                {
+                    let line_text = line_node.text().to_string();
+                    if basic_text_kind_matches(expr, "Line", &line_text) {
+                        let lr = line_node.text_range();
+                        results.push(QueryMatch {
+                            node_id,
+                            kind: "Line".to_owned(),
+                            text: line_text,
+                            span_start: u32::from(lr.start()),
+                            span_end: u32::from(lr.end()),
+                            token_idx: None,
+                            capture: Some(capture),
+                            scope_depth: line_depth,
+                        });
+                    }
+                }
+                continue; // semantic is always line-level — skip other paths
+            }
+
+            // ── identifier name search (token-depth) ─────────────────────────
+            if is_ident {
+                let target = expr.identifier_name.as_deref().unwrap();
+                for (tidx, (kind, text, start, end)) in
+                    raw_tokens.iter().enumerate()
+                {
+                    if kind == "Identifier" && text == target {
+                        if basic_text_kind_matches(expr, kind, text) {
+                            results.push(QueryMatch {
+                                node_id,
+                                kind: kind.clone(),
+                                text: text.clone(),
+                                span_start: *start,
+                                span_end: *end,
+                                token_idx: Some(tidx as u32),
+                                capture: None,
+                                scope_depth: line_depth,
+                            });
+                        }
+                    }
+                }
+                continue; // identifier search is always token-level
+            }
+
+            // ── generic token-depth search ───────────────────────────────────
+            if token_level {
+                for (tidx, (kind, text, start, end)) in
+                    raw_tokens.iter().enumerate()
+                {
+                    if basic_text_kind_matches(expr, kind, text) {
+                        results.push(QueryMatch {
+                            node_id,
+                            kind: kind.clone(),
+                            text: text.clone(),
+                            span_start: *start,
+                            span_end: *end,
+                            token_idx: Some(tidx as u32),
+                            capture: None,
+                            scope_depth: line_depth,
+                        });
+                    }
+                }
+            } else {
+                // ── generic line-depth search ────────────────────────────────
+                let line_text = line_node.text().to_string();
+                if basic_text_kind_matches(expr, "Line", &line_text) {
+                    let lr = line_node.text_range();
+                    results.push(QueryMatch {
+                        node_id,
+                        kind: "Line".to_owned(),
+                        text: line_text,
+                        span_start: u32::from(lr.start()),
+                        span_end: u32::from(lr.end()),
+                        token_idx: None,
+                        capture: None,
+                        scope_depth: line_depth,
+                    });
+                }
+            }
+        }
+
+        results
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Query helpers
+// ---------------------------------------------------------------------------
+
+/// Check whether `kind` and `text` satisfy the text/kind filter fields of
+/// `expr`.  Does **not** check `semantic`, `identifier_name`, `node_id_*`,
+/// or `scope_*` — those are handled directly in [`CstFile::query`].
+fn basic_text_kind_matches(expr: &QueryExpr, kind: &str, text: &str) -> bool {
+    if let Some(ref k) = expr.kind {
+        if !k.eq_ignore_ascii_case(kind) {
+            return false;
+        }
+    }
+    if let Some(ref needle) = expr.text_contains {
+        if !text.contains(needle.as_str()) {
+            return false;
+        }
+    }
+    if let Some(ref pattern) = expr.text_glob {
+        if !text_glob_matches(pattern, text) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Detect a named semantic pattern in a line's raw token list and return the
+/// captured name on success, or `None` when the pattern does not match.
+///
+/// `tokens` is the raw `(kind_name, text, span_start, span_end)` vector for
+/// the whole line, including whitespace and newline tokens.
+fn detect_semantic_pattern(
+    tokens: &[(String, String, u32, u32)],
+    pattern: &str,
+) -> Option<String> {
+    // Build a compact, whitespace-free view for easier positional matching.
+    let code: Vec<(&str, &str)> = tokens
+        .iter()
+        .filter(|(k, _, _, _)| k != "Whitespace" && k != "Newline")
+        .map(|(k, t, _, _)| (k.as_str(), t.as_str()))
+        .collect();
+
+    match pattern {
+        "fn_def"     => keyword_then_ident(&code, "fn"),
+        "struct_def" => keyword_then_ident(&code, "struct"),
+        "enum_def"   => keyword_then_ident(&code, "enum"),
+        "trait_def"  => keyword_then_ident(&code, "trait"),
+        "type_def"   => keyword_then_ident(&code, "type"),
+
+        // impl [Generics for] Type  →  first Identifier after `impl`
+        "impl_block" => keyword_then_ident(&code, "impl"),
+
+        // use <path>;  →  everything between `use` and `;`
+        "use_stmt" => {
+            if code.first().map(|&(k, t)| k == "Keyword" && t == "use") != Some(true) {
+                return None;
+            }
+            let path: String = code[1..]
+                .iter()
+                .take_while(|&&(_, t)| t != ";")
+                .map(|&(_, t)| t)
+                .collect::<Vec<_>>()
+                .join("");
+            let trimmed = path.trim().to_owned();
+            if trimmed.is_empty() { None } else { Some(trimmed) }
+        }
+
+        // let [mut] <name>  /  const <name>  /  static [mut] <name>
+        "variable_def" => {
+            let &(first_k, first_t) = code.first()?;
+            if first_k != "Keyword"
+                || !matches!(first_t, "let" | "const" | "static")
+            {
+                return None;
+            }
+            let mut iter = code[1..].iter().peekable();
+            // Skip one optional `mut` keyword.
+            if iter.peek().map(|&&(k, t)| k == "Keyword" && t == "mut") == Some(true) {
+                iter.next();
+            }
+            iter.find(|&&(k, _)| k == "Identifier")
+                .map(|&(_, t)| t.to_owned())
+        }
+
+        // <name>!(…)
+        "macro_call" => {
+            for i in 0..code.len().saturating_sub(1) {
+                let (k0, t0) = code[i];
+                let (k1, t1) = code[i + 1];
+                if k0 == "Identifier" && k1 == "Punctuation" && t1 == "!" {
+                    return Some(t0.to_owned());
+                }
+            }
+            None
+        }
+
+        _ => None,
+    }
+}
+
+/// Return the text of the first `Identifier` token that appears after the
+/// given `keyword` in a whitespace-stripped token list.
+fn keyword_then_ident(code: &[(&str, &str)], keyword: &str) -> Option<String> {
+    let pos = code
+        .iter()
+        .position(|&(k, t)| k == "Keyword" && t == keyword)?;
+    code[pos + 1..]
+        .iter()
+        .find(|&&(k, _)| k == "Identifier")
+        .map(|&(_, t)| t.to_owned())
+}
+
+/// Glob matching for arbitrary text (no path-separator semantics).
+///
+/// - `*` matches any sequence of characters (including empty).
+/// - `?` matches exactly one character.
+fn text_glob_matches(pattern: &str, text: &str) -> bool {
+    text_glob_inner(pattern.as_bytes(), text.as_bytes())
+}
+
+fn text_glob_inner(pat: &[u8], txt: &[u8]) -> bool {
+    match pat.split_first() {
+        None => txt.is_empty(),
+        Some((&b'*', rest)) => {
+            // Collapse consecutive `*`s for efficiency.
+            let mut rest = rest;
+            while rest.first() == Some(&b'*') {
+                rest = &rest[1..];
+            }
+            for i in 0..=txt.len() {
+                if text_glob_inner(rest, &txt[i..]) {
+                    return true;
+                }
+            }
+            false
+        }
+        Some((&b'?', rest)) => match txt.split_first() {
+            Some((_, rest_t)) => text_glob_inner(rest, rest_t),
+            None => false,
+        },
+        Some((&pc, rest_p)) => match txt.split_first() {
+            Some((&tc, rest_t)) if tc == pc => text_glob_inner(rest_p, rest_t),
+            _ => false,
+        },
+    }
+}
 // ---------------------------------------------------------------------------
 
 /// Map a `lexer::TokenKind` to the corresponding `SyntaxKind`.
@@ -926,5 +1388,198 @@ mod tests {
         assert_eq!(v1.version, 1);
         assert_eq!(v2.version, 2);
         assert_eq!(v3.version, 3);
+    }
+
+    // ── query: basic text / kind filters ────────────────────────────────────
+
+    fn no_filter() -> QueryExpr {
+        QueryExpr {
+            kind: None,
+            text_contains: None,
+            text_glob: None,
+            node_id_from: None,
+            node_id_to: None,
+            depth: None,
+            semantic: None,
+            identifier_name: None,
+            scope_depth_min: None,
+            scope_depth_max: None,
+        }
+    }
+
+    #[test]
+    fn query_no_filter_returns_all_lines() {
+        let file = sample_file();
+        let matches = file.query(&no_filter());
+        // CONTENT has 3 lines
+        assert_eq!(matches.len(), 3);
+        assert!(matches.iter().all(|m| m.kind == "Line"));
+    }
+
+    #[test]
+    fn query_line_by_text_contains() {
+        let file = sample_file();
+        let expr = QueryExpr {
+            text_contains: Some("println".to_owned()),
+            ..no_filter()
+        };
+        let matches = file.query(&expr);
+        assert_eq!(matches.len(), 1);
+        assert!(matches[0].text.contains("println"));
+    }
+
+    #[test]
+    fn query_line_by_text_glob() {
+        let file = sample_file();
+        let expr = QueryExpr {
+            text_glob: Some("fn *".to_owned()),
+            ..no_filter()
+        };
+        let matches = file.query(&expr);
+        assert_eq!(matches.len(), 1);
+        assert!(matches[0].text.starts_with("fn "));
+    }
+
+    #[test]
+    fn query_line_by_node_id_range() {
+        let file = sample_file();
+        let expr = QueryExpr {
+            node_id_from: Some(1),
+            node_id_to: Some(1),
+            ..no_filter()
+        };
+        let matches = file.query(&expr);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].node_id, 1);
+    }
+
+    #[test]
+    fn query_no_matches_returns_empty() {
+        let file = sample_file();
+        let expr = QueryExpr {
+            text_contains: Some("XYZNOTHERE".to_owned()),
+            ..no_filter()
+        };
+        assert!(file.query(&expr).is_empty());
+    }
+
+    // ── query: token-depth ───────────────────────────────────────────────────
+
+    #[test]
+    fn query_token_by_kind_keyword() {
+        let file = sample_file();
+        let expr = QueryExpr {
+            depth: Some("token".to_owned()),
+            kind: Some("Keyword".to_owned()),
+            ..no_filter()
+        };
+        let matches = file.query(&expr);
+        // "fn main() {\n" contains `fn`; body contains none; "}" contains none
+        assert!(!matches.is_empty());
+        assert!(matches.iter().all(|m| m.kind == "Keyword"));
+        assert!(matches.iter().all(|m| m.token_idx.is_some()));
+    }
+
+    #[test]
+    fn query_identifier_name() {
+        let file = sample_file();
+        let expr = QueryExpr {
+            identifier_name: Some("main".to_owned()),
+            ..no_filter()
+        };
+        let matches = file.query(&expr);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].text, "main");
+        assert_eq!(matches[0].kind, "Identifier");
+        assert_eq!(matches[0].node_id, 0); // on first line
+    }
+
+    // ── query: semantic patterns ─────────────────────────────────────────────
+
+    #[test]
+    fn query_semantic_fn_def() {
+        let file = sample_file();
+        let expr = QueryExpr {
+            semantic: Some("fn_def".to_owned()),
+            ..no_filter()
+        };
+        let matches = file.query(&expr);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].capture.as_deref(), Some("main"));
+        assert_eq!(matches[0].node_id, 0);
+    }
+
+    #[test]
+    fn query_semantic_macro_call() {
+        let file = sample_file();
+        let expr = QueryExpr {
+            semantic: Some("macro_call".to_owned()),
+            ..no_filter()
+        };
+        let matches = file.query(&expr);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].capture.as_deref(), Some("println"));
+    }
+
+    #[test]
+    fn query_semantic_variable_def() {
+        let src = "fn f() {\n    let mut x = 1;\n    const Y: u32 = 2;\n    static Z: i32 = 0;\n}\n";
+        let file = CstFile::parse(PathBuf::from("v.rs"), src);
+        let expr = QueryExpr {
+            semantic: Some("variable_def".to_owned()),
+            ..no_filter()
+        };
+        let matches = file.query(&expr);
+        assert_eq!(matches.len(), 3);
+        let names: Vec<_> = matches.iter().map(|m| m.capture.as_deref().unwrap()).collect();
+        assert!(names.contains(&"x"));
+        assert!(names.contains(&"Y"));
+        assert!(names.contains(&"Z"));
+    }
+
+    // ── query: scope depth ───────────────────────────────────────────────────
+
+    #[test]
+    fn query_scope_depth_top_level_only() {
+        let file = sample_file();
+        // Only matches lines at brace depth 0 (top-level).
+        let expr = QueryExpr {
+            scope_depth_max: Some(0),
+            ..no_filter()
+        };
+        let matches = file.query(&expr);
+        // Line 0: "fn main() {\n" is at depth 0 ✓
+        // Line 1: "    println!...\n" is at depth 1 ✗
+        // Line 2: "}\n" is at depth 1 at its start ✗ (depth increases after `{`)
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].node_id, 0);
+    }
+
+    #[test]
+    fn query_scope_depth_inside_block() {
+        let file = sample_file();
+        // Only matches lines inside at least one block.
+        let expr = QueryExpr {
+            scope_depth_min: Some(1),
+            ..no_filter()
+        };
+        let matches = file.query(&expr);
+        // Lines 1 and 2 are at depth ≥ 1.
+        assert_eq!(matches.len(), 2);
+    }
+
+    #[test]
+    fn query_semantic_fn_def_at_top_level_only() {
+        // Two functions: one top-level, one nested (unusual but valid Rust).
+        let src = "fn outer() {\n    fn inner() {}\n}\n";
+        let file = CstFile::parse(PathBuf::from("nested.rs"), src);
+        let expr = QueryExpr {
+            semantic: Some("fn_def".to_owned()),
+            scope_depth_max: Some(0),
+            ..no_filter()
+        };
+        let matches = file.query(&expr);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].capture.as_deref(), Some("outer"));
     }
 }

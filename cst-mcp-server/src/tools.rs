@@ -121,6 +121,55 @@ pub struct SaveParams {
     pub path: String,
 }
 
+// ── Phase 6: query + help ────────────────────────────────────────────────────
+
+/// Parameters for `query_file`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct QueryFileParams {
+    /// Path to the tracked file to query (absolute or workspace-relative).
+    pub path: String,
+    /// Structured query expression — see `query_tool` for full documentation.
+    pub query: crate::cst::QueryExpr,
+}
+
+/// Optional graph-search specification (reserved for future use).
+///
+/// When graph search is implemented, this will allow expressing relationship
+/// queries such as "files that import symbol X", "callers of function Y", or
+/// "modules reachable from entry point Z".  The schema will be stabilised in a
+/// future release; pass `null` or omit this field to use the current text/
+/// semantic search behaviour.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GraphQuery {
+    /// Relationship kind to traverse (e.g. `"imports"`, `"calls"`,
+    /// `"references"`).  Reserved — not yet evaluated.
+    pub relation: Option<String>,
+    /// Starting file or symbol for the graph traversal.  Reserved.
+    pub from: Option<String>,
+    /// Maximum edge hops to follow.  Reserved.
+    pub max_depth: Option<u32>,
+}
+
+/// Parameters for `query_workspace`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct QueryWorkspaceParams {
+    /// Structured query to run against every tracked file.
+    pub query: crate::cst::QueryExpr,
+    /// Graph search specification.  Currently reserved for future use — pass
+    /// `null` or omit.  When graph search is implemented this will allow
+    /// relationship-aware queries across the tracked file set (import graphs,
+    /// call graphs, reference chains, etc.).
+    pub graph: Option<GraphQuery>,
+}
+
+/// Parameters for `query_tool` (help / tool catalog).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct QueryToolParams {
+    /// Name of the specific tool to look up (`"track_file"`, `"query_file"`,
+    /// …).  Omit to receive the full catalog plus a tool-selection guide.
+    pub tool_name: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Server struct
 // ---------------------------------------------------------------------------
@@ -629,4 +678,429 @@ impl CstMcpServer {
             }
         }
     }
+
+    /// Query the CST of a single tracked file using structured filters,
+    /// semantic patterns, and scope-depth constraints.
+    ///
+    /// ## Filters
+    ///
+    /// All filter fields in `query` are optional and AND-ed together.
+    ///
+    /// **Text / kind filters** (`kind`, `text_contains`, `text_glob`) match
+    /// the text of a line or token.  `kind` is case-insensitive.
+    ///
+    /// **Line-range filter** (`node_id_from`, `node_id_to`) restricts the
+    /// search to a contiguous block of lines.
+    ///
+    /// **Depth** (`depth`) selects `"line"` (default) or `"token"` level.
+    ///
+    /// **Semantic patterns** (`semantic`) find named syntactic constructs in
+    /// Rust files and return a `capture` (function name, variable name, …):
+    /// `fn_def`, `struct_def`, `enum_def`, `trait_def`, `impl_block`,
+    /// `type_def`, `variable_def`, `use_stmt`, `macro_call`.
+    ///
+    /// **Identifier search** (`identifier_name`) finds every token-level
+    /// occurrence of an exact identifier name.
+    ///
+    /// **Scope-depth filters** (`scope_depth_min`, `scope_depth_max`) restrict
+    /// results to a specific brace-nesting level (0 = top-level).  Combine
+    /// with `semantic` to get, e.g., only top-level function definitions:
+    /// `{"semantic":"fn_def","scope_depth_max":0}`.
+    ///
+    /// ## Response JSON
+    ///
+    /// ```json
+    /// {
+    ///   "file": "/abs/path",
+    ///   "language": "Rust",
+    ///   "version": 1,
+    ///   "match_count": 2,
+    ///   "matches": [
+    ///     { "node_id":0, "kind":"Line", "text":"fn main() {\n",
+    ///       "span_start":0, "span_end":12, "scope_depth":0,
+    ///       "capture":"main" }
+    ///   ]
+    /// }
+    /// ```
+    #[tool(
+        description = "Query the CST of a tracked file with text, semantic, identifier, and \
+                        scope-depth filters.  Returns JSON: {file, language, version, \
+                        match_count, matches:[{node_id,kind,text,span_start,span_end,\
+                        scope_depth,token_idx?,capture?}]}."
+    )]
+    async fn query_file(
+        &self,
+        Parameters(QueryFileParams { path, query }): Parameters<QueryFileParams>,
+    ) -> String {
+        let path = match self.access.resolve_and_check("query", &path) {
+            Err(e) => return format!("error: {e}"),
+            Ok(p) => p,
+        };
+        let state = self.state.read().await;
+        match state.get(&path) {
+            None => format!("error: {path:?} is not tracked — call track_file first"),
+            Some(file) => {
+                let matches = file.query(&query);
+                let match_count = matches.len();
+                let lang = format!("{:?}", file.language());
+                let version = file.version;
+                let match_values: Vec<_> = matches
+                    .into_iter()
+                    .map(|m| {
+                        let mut obj = serde_json::json!({
+                            "node_id": m.node_id,
+                            "kind": m.kind,
+                            "text": m.text,
+                            "span_start": m.span_start,
+                            "span_end": m.span_end,
+                            "scope_depth": m.scope_depth,
+                        });
+                        if let Some(tidx) = m.token_idx {
+                            obj["token_idx"] = serde_json::json!(tidx);
+                        }
+                        if let Some(cap) = m.capture {
+                            obj["capture"] = serde_json::json!(cap);
+                        }
+                        obj
+                    })
+                    .collect();
+
+                serde_json::json!({
+                    "file": path.to_string_lossy(),
+                    "language": lang,
+                    "version": version,
+                    "match_count": match_count,
+                    "matches": match_values,
+                })
+                .to_string()
+            }
+        }
+    }
+
+    /// Run the same query across every tracked file in the workspace.
+    ///
+    /// The `query` field accepts exactly the same expression as `query_file`.
+    /// Results are grouped by file and include per-file `version` and
+    /// `match_count`.  Files with zero matches are omitted from the output.
+    ///
+    /// ## Graph search (future)
+    ///
+    /// The `graph` field is reserved for a planned cross-file relationship
+    /// search layer (import graphs, call graphs, reference chains).  Pass
+    /// `null` or omit it — it is accepted but ignored in the current release.
+    ///
+    /// ## Response JSON
+    ///
+    /// ```json
+    /// {
+    ///   "total_files_searched": 3,
+    ///   "files_with_matches": 1,
+    ///   "total_matches": 2,
+    ///   "results": [
+    ///     { "file": "/abs/path/a.rs", "language": "Rust", "version": 0,
+    ///       "match_count": 2, "matches": [ … ] }
+    ///   ]
+    /// }
+    /// ```
+    #[tool(
+        description = "Run a query across all tracked files in the workspace.  Same query \
+                        expression as query_file.  The `graph` field is reserved for future \
+                        cross-file relationship search (import/call graphs).  Returns JSON: \
+                        {total_files_searched, files_with_matches, total_matches, results:[…]}."
+    )]
+    async fn query_workspace(
+        &self,
+        Parameters(QueryWorkspaceParams { query, graph: _ }): Parameters<QueryWorkspaceParams>,
+    ) -> String {
+        let state = self.state.read().await;
+        let paths = state.tracked_paths();
+        let total_files_searched = paths.len();
+        let mut results: Vec<serde_json::Value> = Vec::new();
+        let mut total_matches: usize = 0;
+
+        for path in paths {
+            if let Some(file) = state.get(&path) {
+                let matches = file.query(&query);
+                if matches.is_empty() {
+                    continue;
+                }
+                total_matches += matches.len();
+                let lang = format!("{:?}", file.language());
+                let version = file.version;
+                let match_count = matches.len();
+                let match_values: Vec<_> = matches
+                    .into_iter()
+                    .map(|m| {
+                        let mut obj = serde_json::json!({
+                            "node_id": m.node_id,
+                            "kind": m.kind,
+                            "text": m.text,
+                            "span_start": m.span_start,
+                            "span_end": m.span_end,
+                            "scope_depth": m.scope_depth,
+                        });
+                        if let Some(tidx) = m.token_idx {
+                            obj["token_idx"] = serde_json::json!(tidx);
+                        }
+                        if let Some(cap) = m.capture {
+                            obj["capture"] = serde_json::json!(cap);
+                        }
+                        obj
+                    })
+                    .collect();
+
+                results.push(serde_json::json!({
+                    "file": path.to_string_lossy(),
+                    "language": lang,
+                    "version": version,
+                    "match_count": match_count,
+                    "matches": match_values,
+                }));
+            }
+        }
+
+        serde_json::json!({
+            "total_files_searched": total_files_searched,
+            "files_with_matches": results.len(),
+            "total_matches": total_matches,
+            "results": results,
+        })
+        .to_string()
+    }
+
+    /// Return documentation and tool-selection guidance for this MCP server.
+    ///
+    /// When `tool_name` is omitted, returns the complete tool catalog plus a
+    /// categorised selection guide.  When `tool_name` is provided, returns
+    /// detailed documentation for that one tool.
+    ///
+    /// Use this tool whenever you are unsure which tool to call next, or when
+    /// you need parameter details, example queries, or a reminder of available
+    /// semantic patterns.
+    #[tool(
+        description = "Get documentation and tool-selection guidance.  Omit tool_name for the \
+                        full catalog + selection guide.  Provide tool_name for focused docs on \
+                        one tool.  Call this when unsure which tool to use."
+    )]
+    async fn query_tool(
+        &self,
+        Parameters(QueryToolParams { tool_name }): Parameters<QueryToolParams>,
+    ) -> String {
+        let catalog = tool_catalog();
+        match tool_name.as_deref() {
+            None | Some("") => serde_json::json!({
+                "selection_guide": SELECTION_GUIDE,
+                "tool_count": catalog.len(),
+                "tools": catalog,
+            })
+            .to_string(),
+            Some(name) => match catalog.iter().find(|t| t["name"] == name) {
+                Some(entry) => entry.to_string(),
+                None => {
+                    let names: Vec<_> = catalog
+                        .iter()
+                        .filter_map(|t| t["name"].as_str())
+                        .collect();
+                    format!(
+                        "error: unknown tool {:?}.  Available: {}",
+                        name,
+                        names.join(", ")
+                    )
+                }
+            },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Static tool catalog used by query_tool
+// ---------------------------------------------------------------------------
+
+const SELECTION_GUIDE: &str = "\
+TRACKING — before reading or editing a file you must track it:\
+\n  1. track_file        → loads file, starts watching for external changes\
+\n  2. list_tracked_files → see what is already tracked\
+\n  3. untrack_file      → release a file from memory\
+\
+\nINSPECTION — explore a tracked file:\
+\n  4. load_file         → quick summary: line count + version\
+\n  5. get_tree_skeleton → all line node_ids with text previews and spans\
+\n  6. get_node          → full text + span for one line (use node_id from skeleton)\
+\n  7. get_line_tokens   → token-level breakdown of one line (Rust files: keyword/ident/…)\
+\
+\nQUERY — find content by pattern (no need to track first, works on already-tracked files):\
+\n  8. query_file        → text, semantic, identifier, or scope-depth search in one file\
+\n  9. query_workspace   → same query across all tracked files; reserved `graph` field for\
+\n                          future cross-file import/call-graph search\
+\
+\nEDITING — mutate the in-memory CST (always pass expected_version to guard conflicts):\
+\n 10. edit_node         → replace one line\
+\n 11. insert_lines      → insert one or more lines at a position\
+\n 12. delete_lines      → remove one or more consecutive lines\
+\n 13. save_file         → flush in-memory CST back to disk\
+\
+\nHELP:\
+\n 14. query_tool        → this tool; get docs for any tool or the full catalog\
+\
+\nTYPICAL WORKFLOW:\
+\n  track_file → query_file (find target) → get_node (read version) → edit_node → save_file";
+
+fn tool_catalog() -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({
+            "name": "track_file",
+            "category": "tracking",
+            "description": "Load a file from disk into memory, parse it as a CST, and register it with the filesystem watcher for auto-reload.",
+            "parameters": [
+                {"name":"path","type":"string","required":true,"description":"Absolute or workspace-relative path to the file."}
+            ],
+            "returns": "\"ok: tracking <path>\" or \"error: …\"",
+        }),
+        serde_json::json!({
+            "name": "untrack_file",
+            "category": "tracking",
+            "description": "Remove a file from memory and stop watching it for changes.",
+            "parameters": [
+                {"name":"path","type":"string","required":true,"description":"Path of the tracked file to release."}
+            ],
+            "returns": "\"ok: untracked <path>\" or \"error: …\"",
+        }),
+        serde_json::json!({
+            "name": "list_tracked_files",
+            "category": "tracking",
+            "description": "List every file currently held in memory, sorted lexicographically.",
+            "parameters": [],
+            "returns": "JSON {count, files:[sorted absolute paths]}",
+        }),
+        serde_json::json!({
+            "name": "load_file",
+            "category": "inspection",
+            "description": "Quick summary of a tracked file: line count and current CST version.",
+            "parameters": [
+                {"name":"path","type":"string","required":true,"description":"Path of the tracked file."}
+            ],
+            "returns": "\"ok: <path> — N lines, CST version V\" or \"error: …\"",
+        }),
+        serde_json::json!({
+            "name": "get_tree_skeleton",
+            "category": "inspection",
+            "description": "List all line (CST node) IDs in a tracked file with text previews and byte spans. Use node_id values with get_node, edit_node, etc.",
+            "parameters": [
+                {"name":"path","type":"string","required":true,"description":"Path of the tracked file."}
+            ],
+            "returns": "JSON {version, nodes:[{node_id,kind,text_preview,span:{start,end}}]}",
+        }),
+        serde_json::json!({
+            "name": "get_node",
+            "category": "inspection",
+            "description": "Get the full text, kind, and byte span of one line node. The returned version should be passed to edit_node as expected_version.",
+            "parameters": [
+                {"name":"path","type":"string","required":true,"description":"Path of the tracked file."},
+                {"name":"node_id","type":"integer","required":true,"description":"0-based line index."}
+            ],
+            "returns": "JSON {node_id, kind, text, span:{start,end}, version}",
+        }),
+        serde_json::json!({
+            "name": "get_line_tokens",
+            "category": "inspection",
+            "description": "Token-level breakdown of a single line. For .rs files: Keyword, Identifier, Literal, Comment, Whitespace, Punctuation, Newline. For plain files: Text.",
+            "parameters": [
+                {"name":"path","type":"string","required":true,"description":"Path of the tracked file."},
+                {"name":"node_id","type":"integer","required":true,"description":"0-based line index."}
+            ],
+            "returns": "JSON {line_node_id, language, tokens:[{token_idx,kind,text,span}], version}",
+        }),
+        serde_json::json!({
+            "name": "query_file",
+            "category": "query",
+            "description": "Search the CST of one tracked file using text, semantic, identifier, and scope-depth filters.",
+            "parameters": [
+                {"name":"path","type":"string","required":true,"description":"Path of the tracked file."},
+                {"name":"query","type":"object","required":true,"description":"QueryExpr — see fields below."}
+            ],
+            "query_fields": {
+                "kind": "Filter by token/line kind (case-insensitive). Line-depth: 'Line'. Token-depth (.rs): Keyword|Identifier|Literal|Comment|Whitespace|Punctuation|Newline.",
+                "text_contains": "Substring match (case-sensitive).",
+                "text_glob": "Glob pattern: * = any chars, ? = one char.",
+                "node_id_from": "First line to consider (0-based, inclusive).",
+                "node_id_to": "Last line to consider (0-based, inclusive).",
+                "depth": "'line' (default) or 'token'. Overridden by semantic/identifier_name.",
+                "semantic": "Named construct: fn_def|struct_def|enum_def|trait_def|impl_block|type_def|variable_def|use_stmt|macro_call. Returns capture (name).",
+                "identifier_name": "Find every token-level occurrence of this exact identifier.",
+                "scope_depth_min": "Only lines at brace depth >= N. 0=top-level.",
+                "scope_depth_max": "Only lines at brace depth <= N."
+            },
+            "examples": [
+                {"description":"All top-level functions","query":{"semantic":"fn_def","scope_depth_max":0}},
+                {"description":"All uses of identifier 'conn'","query":{"identifier_name":"conn"}},
+                {"description":"Lines with TODO","query":{"text_contains":"TODO"}},
+                {"description":"All keyword tokens in first 10 lines","query":{"depth":"token","kind":"Keyword","node_id_to":9}}
+            ],
+            "returns": "JSON {file, language, version, match_count, matches:[{node_id,kind,text,span_start,span_end,scope_depth,token_idx?,capture?}]}",
+        }),
+        serde_json::json!({
+            "name": "query_workspace",
+            "category": "query",
+            "description": "Run the same QueryExpr across all tracked files. Files with zero matches are omitted. The `graph` field is reserved for future cross-file relationship search (import graphs, call graphs, reference chains) — pass null for now.",
+            "parameters": [
+                {"name":"query","type":"object","required":true,"description":"Same QueryExpr as query_file."},
+                {"name":"graph","type":"object|null","required":false,"description":"Reserved for future graph search. Pass null or omit."}
+            ],
+            "returns": "JSON {total_files_searched, files_with_matches, total_matches, results:[{file,language,version,match_count,matches}]}",
+        }),
+        serde_json::json!({
+            "name": "edit_node",
+            "category": "editing",
+            "description": "Replace the text of one line node in a tracked file's CST. All other lines are preserved verbatim. Pass expected_version (from get_node or load_file) to detect conflicts.",
+            "parameters": [
+                {"name":"path","type":"string","required":true},
+                {"name":"node_id","type":"integer","required":true,"description":"0-based line index."},
+                {"name":"new_text","type":"string","required":true,"description":"Replacement text (trailing newline preserved from original)."},
+                {"name":"expected_version","type":"integer","required":false,"description":"Guard against stale edits."}
+            ],
+            "returns": "\"ok: …\" | \"conflict: …\" | \"error: …\"",
+        }),
+        serde_json::json!({
+            "name": "insert_lines",
+            "category": "editing",
+            "description": "Insert one or more new lines into the CST. insert_after=null prepends; insert_after=N inserts after line N. Trailing newline added automatically.",
+            "parameters": [
+                {"name":"path","type":"string","required":true},
+                {"name":"insert_after","type":"integer|null","required":false,"description":"Insert after this line (null = prepend)."},
+                {"name":"lines","type":"array of string","required":true,"description":"Lines to insert."},
+                {"name":"expected_version","type":"integer","required":false}
+            ],
+            "returns": "JSON {inserted_count, first_node_id, version} or \"error: …\"",
+        }),
+        serde_json::json!({
+            "name": "delete_lines",
+            "category": "editing",
+            "description": "Delete one or more consecutive line nodes from the CST.",
+            "parameters": [
+                {"name":"path","type":"string","required":true},
+                {"name":"node_id","type":"integer","required":true,"description":"First line to delete."},
+                {"name":"count","type":"integer","required":true,"description":"Number of lines to delete (>= 1)."},
+                {"name":"expected_version","type":"integer","required":false}
+            ],
+            "returns": "\"ok: …\" | \"conflict: …\" | \"error: …\"",
+        }),
+        serde_json::json!({
+            "name": "save_file",
+            "category": "editing",
+            "description": "Flush the in-memory CST for a tracked file to disk (lossless round-trip).",
+            "parameters": [
+                {"name":"path","type":"string","required":true}
+            ],
+            "returns": "\"ok: saved <path> (CST version V)\" or \"error: …\"",
+        }),
+        serde_json::json!({
+            "name": "query_tool",
+            "category": "help",
+            "description": "Return documentation and tool-selection guidance. Omit tool_name for the full catalog. Provide tool_name for focused docs.",
+            "parameters": [
+                {"name":"tool_name","type":"string","required":false,"description":"Name of the tool to look up, or omit for full catalog."}
+            ],
+            "returns": "JSON catalog or single tool entry.",
+        }),
+    ]
 }
