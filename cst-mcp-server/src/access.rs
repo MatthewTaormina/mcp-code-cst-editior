@@ -33,6 +33,24 @@
 //! }
 //! ```
 //!
+//! ## Recognised action names
+//!
+//! | Action        | Tool(s) that use it                              |
+//! |---------------|--------------------------------------------------|
+//! | `track`       | `track_file`                                     |
+//! | `untrack`     | `untrack_file`                                   |
+//! | `load`        | `load_file`                                      |
+//! | `read`        | `get_node`, `get_tree_skeleton`, `get_line_tokens` |
+//! | `edit`        | `edit_node`                                      |
+//! | `insert`      | `insert_lines`                                   |
+//! | `delete`      | `delete_lines`                                   |
+//! | `save`        | `save_file`                                      |
+//! | `query`       | `query_file`, `query_workspace`                  |
+//! | `create`      | `create_file`                                    |
+//! | `delete_file` | `delete_file`                                    |
+//!
+//! Use `"*"` in an action list to match any of the above.
+//!
 //! `resources` patterns are relative to the workspace root unless they start
 //! with `/` (treated as absolute).  `"*"` in an action list matches any
 //! action.  Glob patterns support `*` (non-separator), `**` (any depth), and

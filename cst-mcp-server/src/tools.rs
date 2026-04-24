@@ -114,6 +114,25 @@ pub struct DeleteLinesParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListTrackedFilesParams {}
 
+/// Parameters for `create_file`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CreateFileParams {
+    /// Absolute path of the file to create (must be inside the workspace).
+    pub path: String,
+    /// Initial content for the new file.  Defaults to empty if omitted.
+    pub content: Option<String>,
+    /// When `true`, the newly-created file is automatically tracked in memory
+    /// after it is written to disk.  Defaults to `false`.
+    pub track: Option<bool>,
+}
+
+/// Parameters for `delete_file`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DeleteFileParams {
+    /// Absolute path of the file to delete (must be inside the workspace).
+    pub path: String,
+}
+
 /// Parameters for `save_file`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SaveParams {
@@ -679,6 +698,108 @@ impl CstMcpServer {
         }
     }
 
+    /// Create a new file on disk inside the workspace.
+    ///
+    /// The file is written with the provided `content` (or empty if omitted).
+    /// If `track` is `true`, the file is also loaded into the in-memory CST
+    /// immediately (equivalent to calling `track_file` afterwards).
+    ///
+    /// Returns an error if the file already exists or if the path is outside
+    /// the workspace root.
+    #[tool(
+        description = "Create a new file on disk inside the workspace with optional initial content. \
+                        Set track=true to immediately load it into memory. \
+                        Returns \"ok: created <path>\" or \"error: …\"."
+    )]
+    async fn create_file(
+        &self,
+        Parameters(CreateFileParams { path, content, track }): Parameters<CreateFileParams>,
+    ) -> String {
+        let resolved = match self.access.resolve_and_check("create", &path) {
+            Err(e) => return format!("error: {e}"),
+            Ok(p) => p,
+        };
+
+        // Refuse to overwrite an existing file.
+        if resolved.exists() {
+            return format!("error: {resolved:?} already exists");
+        }
+
+        // Create parent directories if necessary.
+        if let Some(parent) = resolved.parent() {
+            if !parent.exists() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    return format!("error: could not create parent directories for {resolved:?}: {e}");
+                }
+            }
+        }
+
+        let body = content.unwrap_or_default();
+        if let Err(e) = std::fs::write(&resolved, body.as_bytes()) {
+            return format!("error: could not write {resolved:?}: {e}");
+        }
+
+        let mut msg = format!("ok: created {resolved:?}");
+
+        // Optionally track the new file immediately.
+        if track.unwrap_or(false) {
+            match std::fs::read_to_string(&resolved) {
+                Err(e) => {
+                    msg.push_str(&format!("; warning: track failed: {e}"));
+                }
+                Ok(text) => {
+                    let file = CstFile::parse(resolved.clone(), &text);
+                    self.state.write().await.track(resolved.clone(), file);
+                    if let Err(e) = watch_path(&self.watcher, &resolved) {
+                        eprintln!("watcher: could not watch {resolved:?}: {e}");
+                    }
+                    msg.push_str("; tracking");
+                }
+            }
+        }
+
+        msg
+    }
+
+    /// Delete a file from disk.
+    ///
+    /// If the file is currently tracked it is automatically untracked (and
+    /// unwatched) before deletion so the in-memory state stays consistent.
+    ///
+    /// Returns an error if the file does not exist or is outside the
+    /// workspace root.
+    #[tool(
+        description = "Delete a file from disk inside the workspace. \
+                        If the file is currently tracked it is automatically untracked first. \
+                        Returns \"ok: deleted <path>\" or \"error: …\"."
+    )]
+    async fn delete_file(
+        &self,
+        Parameters(DeleteFileParams { path }): Parameters<DeleteFileParams>,
+    ) -> String {
+        let resolved = match self.access.resolve_and_check("delete_file", &path) {
+            Err(e) => return format!("error: {e}"),
+            Ok(p) => p,
+        };
+
+        if !resolved.exists() {
+            return format!("error: {resolved:?} does not exist");
+        }
+
+        // Untrack first so in-memory state stays consistent.
+        let was_tracked = self.state.write().await.untrack(&resolved);
+        if was_tracked {
+            if let Err(e) = unwatch_path(&self.watcher, &resolved) {
+                eprintln!("watcher: could not unwatch {resolved:?}: {e}");
+            }
+        }
+
+        match std::fs::remove_file(&resolved) {
+            Ok(()) => format!("ok: deleted {resolved:?}"),
+            Err(e) => format!("error: could not delete {resolved:?}: {e}"),
+        }
+    }
+
     /// Query the CST of a single tracked file using structured filters,
     /// semantic patterns, and scope-depth constraints.
     ///
@@ -922,28 +1043,37 @@ TRACKING — before reading or editing a file you must track it:\
 \n  2. list_tracked_files → see what is already tracked\
 \n  3. untrack_file      → release a file from memory\
 \
+\nFILE MANAGEMENT — create or delete files on disk:\
+\n  4. create_file       → create a new file (optionally with content; set track=true to load it immediately)\
+\n  5. delete_file       → delete a file from disk (auto-untracks if it was tracked)\
+\
 \nINSPECTION — explore a tracked file:\
-\n  4. load_file         → quick summary: line count + version\
-\n  5. get_tree_skeleton → all line node_ids with text previews and spans\
-\n  6. get_node          → full text + span for one line (use node_id from skeleton)\
-\n  7. get_line_tokens   → token-level breakdown of one line (Rust files: keyword/ident/…)\
+\n  6. load_file         → quick summary: line count + version\
+\n  7. get_tree_skeleton → all line node_ids with text previews and spans\
+\n  8. get_node          → full text + span for one line (use node_id from skeleton)\
+\n  9. get_line_tokens   → token-level breakdown of one line (Rust files: keyword/ident/…)\
 \
 \nQUERY — find content by pattern (no need to track first, works on already-tracked files):\
-\n  8. query_file        → text, semantic, identifier, or scope-depth search in one file\
-\n  9. query_workspace   → same query across all tracked files; reserved `graph` field for\
+\n 10. query_file        → text, semantic, identifier, or scope-depth search in one file\
+\n 11. query_workspace   → same query across all tracked files; reserved `graph` field for\
 \n                          future cross-file import/call-graph search\
 \
 \nEDITING — mutate the in-memory CST (always pass expected_version to guard conflicts):\
-\n 10. edit_node         → replace one line\
-\n 11. insert_lines      → insert one or more lines at a position\
-\n 12. delete_lines      → remove one or more consecutive lines\
-\n 13. save_file         → flush in-memory CST back to disk\
+\n 12. edit_node         → replace one line\
+\n 13. insert_lines      → insert one or more lines at a position\
+\n 14. delete_lines      → remove one or more consecutive lines\
+\n 15. save_file         → flush in-memory CST back to disk\
 \
 \nHELP:\
-\n 14. query_tool        → this tool; get docs for any tool or the full catalog\
+\n 16. query_tool        → this tool; get docs for any tool or the full catalog\
 \
 \nTYPICAL WORKFLOW:\
-\n  track_file → query_file (find target) → get_node (read version) → edit_node → save_file";
+\n  track_file → query_file (find target) → get_node (read version) → edit_node → save_file\
+\nCREATE WORKFLOW:\
+\n  create_file (track=true) → insert_lines → save_file\
+\nDELETE WORKFLOW:\
+\n  delete_file (auto-untracks)";
+
 
 fn tool_catalog() -> Vec<serde_json::Value> {
     vec![
@@ -971,6 +1101,26 @@ fn tool_catalog() -> Vec<serde_json::Value> {
             "description": "List every file currently held in memory, sorted lexicographically.",
             "parameters": [],
             "returns": "JSON {count, files:[sorted absolute paths]}",
+        }),
+        serde_json::json!({
+            "name": "create_file",
+            "category": "file_management",
+            "description": "Create a new file on disk inside the workspace with optional initial content. Set track=true to immediately load the new file into memory. Fails if the file already exists.",
+            "parameters": [
+                {"name":"path","type":"string","required":true,"description":"Absolute or workspace-relative path of the new file."},
+                {"name":"content","type":"string","required":false,"description":"Initial file content. Defaults to empty."},
+                {"name":"track","type":"boolean","required":false,"description":"If true, track the file immediately after creation. Default false."}
+            ],
+            "returns": "\"ok: created <path>\" (with \"; tracking\" suffix when track=true) or \"error: …\"",
+        }),
+        serde_json::json!({
+            "name": "delete_file",
+            "category": "file_management",
+            "description": "Delete a file from disk. If the file is currently tracked it is automatically untracked and unwatched first.",
+            "parameters": [
+                {"name":"path","type":"string","required":true,"description":"Absolute or workspace-relative path of the file to delete."}
+            ],
+            "returns": "\"ok: deleted <path>\" or \"error: …\"",
         }),
         serde_json::json!({
             "name": "load_file",
