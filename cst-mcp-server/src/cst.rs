@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use rowan::{GreenNode, GreenNodeBuilder, Language, NodeOrToken, SyntaxNode};
+use rowan::{GreenNode, GreenNodeBuilder, GreenToken, Language, NodeOrToken, SyntaxNode};
 use serde::Serialize;
 
 use crate::lexer::{self, TokenKind};
@@ -315,41 +315,144 @@ impl CstFile {
     /// Replace the content of the line identified by `node_id` (0-based line
     /// index) with `new_text`, preserving all other lines verbatim.
     ///
-    /// Returns a new `CstFile` with an incremented version on success.
+    /// Uses rowan's native `replace_child` to surgically swap only the
+    /// affected Line green node in the tree, leaving all sibling nodes shared
+    /// (O(1) clone via `Arc`).  Returns a new `CstFile` with an incremented
+    /// version on success.
     pub fn replace_node(&self, node_id: NodeId, new_text: &str) -> anyhow::Result<CstFile> {
-        let current_text = self.to_text();
-
-        // Collect into owned Strings so we can mutate one element freely
-        // without any borrowing or memory-management complications.
-        let mut lines: Vec<String> = current_text
-            .split_inclusive('\n')
-            .map(String::from)
-            .collect();
-
         let idx = node_id as usize;
-        if idx >= lines.len() {
+        let existing_count = self.root.children().count();
+
+        if idx >= existing_count {
             anyhow::bail!(
-                "node_id {} is out of range (file has {} lines)",
+                "node_id {} is out of range (file has {} line nodes)",
                 node_id,
-                lines.len()
+                existing_count
             );
         }
 
-        // Preserve the trailing newline of the original line so that lines
-        // below it are not shifted.
-        let original_had_newline = lines[idx].ends_with('\n');
-        lines[idx] = if original_had_newline && !new_text.ends_with('\n') {
-            format!("{new_text}\n")
-        } else {
-            new_text.to_owned()
-        };
+        // Preserve the trailing newline of the original line so that the
+        // lines below it are not shifted.
+        let original_text = self.get_node(node_id)?.text;
+        let effective: std::borrow::Cow<'_, str> =
+            if original_text.ends_with('\n') && !new_text.ends_with('\n') {
+                std::borrow::Cow::Owned(format!("{new_text}\n"))
+            } else {
+                std::borrow::Cow::Borrowed(new_text)
+            };
 
-        let new_content = lines.concat();
-        let root = build_tree(&new_content, self.language);
+        // Build only the replacement Line node — all other nodes are shared.
+        let new_line = build_line_node(&effective, self.language);
+        let new_root = self
+            .root
+            .replace_child(idx, NodeOrToken::Node(new_line));
 
         Ok(CstFile {
             path: self.path.clone(),
-            root,
+            root: new_root,
+            version: self.version + 1,
+            language: self.language,
+        })
+    }
+
+    /// Insert one or more new lines into the file's CST.
+    ///
+    /// `insert_after` is the 0-based index of the line *after which* the new
+    /// lines are inserted.  Pass `None` to prepend at the beginning of the
+    /// file.  Each string in `lines` becomes one new Line node; a trailing
+    /// `\n` is appended automatically when missing.
+    ///
+    /// Uses rowan's `splice_children` to perform the insertion without
+    /// re-parsing unchanged lines.  Returns a new `CstFile` with an
+    /// incremented version on success.
+    pub fn insert_lines(
+        &self,
+        insert_after: Option<NodeId>,
+        lines: &[String],
+    ) -> anyhow::Result<CstFile> {
+        if lines.is_empty() {
+            anyhow::bail!("lines must not be empty");
+        }
+
+        let existing_count = self.root.children().count();
+
+        let insert_idx = match insert_after {
+            None => 0,
+            Some(id) => {
+                let idx = id as usize;
+                if idx >= existing_count {
+                    anyhow::bail!(
+                        "insert_after {} is out of range (file has {} line nodes)",
+                        id,
+                        existing_count
+                    );
+                }
+                idx + 1
+            }
+        };
+
+        let new_nodes: Vec<NodeOrToken<GreenNode, GreenToken>> = lines
+            .iter()
+            .map(|text| {
+                let effective: std::borrow::Cow<'_, str> = if text.ends_with('\n') {
+                    std::borrow::Cow::Borrowed(text.as_str())
+                } else {
+                    std::borrow::Cow::Owned(format!("{text}\n"))
+                };
+                NodeOrToken::Node(build_line_node(&effective, self.language))
+            })
+            .collect();
+
+        let new_root = self
+            .root
+            .splice_children(insert_idx..insert_idx, new_nodes);
+
+        Ok(CstFile {
+            path: self.path.clone(),
+            root: new_root,
+            version: self.version + 1,
+            language: self.language,
+        })
+    }
+
+    /// Delete `count` consecutive Line nodes starting at `node_id`.
+    ///
+    /// Uses rowan's `splice_children` to perform the deletion without
+    /// re-parsing unchanged lines.  Returns a new `CstFile` with an
+    /// incremented version on success.
+    pub fn delete_lines(&self, node_id: NodeId, count: u32) -> anyhow::Result<CstFile> {
+        if count == 0 {
+            anyhow::bail!("count must be at least 1");
+        }
+
+        let existing_count = self.root.children().count();
+        let idx = node_id as usize;
+        let end = idx + count as usize;
+
+        if idx >= existing_count {
+            anyhow::bail!(
+                "node_id {} is out of range (file has {} line nodes)",
+                node_id,
+                existing_count
+            );
+        }
+        if end > existing_count {
+            anyhow::bail!(
+                "delete range {}..{} exceeds file length ({} line nodes)",
+                idx,
+                end,
+                existing_count
+            );
+        }
+
+        let new_root = self.root.splice_children(
+            idx..end,
+            std::iter::empty::<NodeOrToken<GreenNode, GreenToken>>(),
+        );
+
+        Ok(CstFile {
+            path: self.path.clone(),
+            root: new_root,
             version: self.version + 1,
             language: self.language,
         })
@@ -371,6 +474,33 @@ fn token_kind_to_syntax(tk: TokenKind) -> SyntaxKind {
         TokenKind::Newline => SyntaxKind::Newline,
         TokenKind::Punctuation => SyntaxKind::Punctuation,
     }
+}
+
+/// Build a single rowan Line green node from raw line text.
+///
+/// Uses the language-appropriate lexer so the resulting Line node has the
+/// same token-level structure as lines built by `build_tree`.  A trailing
+/// `\n` must be included in `text` if required.
+///
+/// The builder's root is the Line node itself — callers can pass the result
+/// directly to `GreenNodeData::replace_child` / `splice_children`.
+fn build_line_node(text: &str, language: FileLanguage) -> GreenNode {
+    let mut b = GreenNodeBuilder::new();
+    let raw = |k: SyntaxKind| rowan::SyntaxKind(k as u16);
+
+    b.start_node(raw(SyntaxKind::Line));
+    match language {
+        FileLanguage::Rust => {
+            for tok in lexer::lex_rust(text) {
+                b.token(raw(token_kind_to_syntax(tok.kind)), tok.text);
+            }
+        }
+        FileLanguage::Plain => {
+            b.token(raw(SyntaxKind::Text), text);
+        }
+    }
+    b.finish_node();
+    b.finish()
 }
 
 /// Build a rowan green tree from raw file text.
@@ -602,5 +732,199 @@ mod tests {
     fn empty_file_produces_no_line_nodes() {
         let file = CstFile::parse(PathBuf::from("empty.rs"), "");
         assert_eq!(file.tree_skeleton().len(), 0);
+    }
+
+    // --- insert_lines ---
+
+    #[test]
+    fn insert_lines_at_beginning() {
+        let file = sample_file();
+        let inserted = file
+            .insert_lines(None, &["// new first line\n".to_owned()])
+            .unwrap();
+        assert_eq!(inserted.version, 1);
+        assert_eq!(inserted.tree_skeleton().len(), 4);
+        assert_eq!(inserted.get_node(0).unwrap().text, "// new first line\n");
+        // Original lines shifted down by one.
+        assert_eq!(inserted.get_node(1).unwrap().text, "fn main() {\n");
+    }
+
+    #[test]
+    fn insert_lines_after_last() {
+        let file = sample_file(); // 3 lines, last idx = 2
+        let inserted = file
+            .insert_lines(Some(2), &["// appended\n".to_owned()])
+            .unwrap();
+        assert_eq!(inserted.tree_skeleton().len(), 4);
+        assert_eq!(inserted.get_node(3).unwrap().text, "// appended\n");
+    }
+
+    #[test]
+    fn insert_lines_in_middle() {
+        let file = sample_file(); // lines: 0=fn, 1=println, 2=}
+        let inserted = file
+            .insert_lines(Some(0), &["    // inserted\n".to_owned()])
+            .unwrap();
+        assert_eq!(inserted.tree_skeleton().len(), 4);
+        assert_eq!(inserted.get_node(0).unwrap().text, "fn main() {\n");
+        assert_eq!(inserted.get_node(1).unwrap().text, "    // inserted\n");
+        assert_eq!(inserted.get_node(2).unwrap().text, "    println!(\"hello\");\n");
+    }
+
+    #[test]
+    fn insert_lines_auto_appends_newline() {
+        let file = sample_file();
+        // Text without trailing \n → server must add one.
+        let inserted = file
+            .insert_lines(None, &["// no newline".to_owned()])
+            .unwrap();
+        assert!(
+            inserted.get_node(0).unwrap().text.ends_with('\n'),
+            "inserted line must end with \\n"
+        );
+    }
+
+    #[test]
+    fn insert_lines_multiple() {
+        let file = sample_file();
+        let lines = vec!["// a\n".to_owned(), "// b\n".to_owned()];
+        let inserted = file.insert_lines(Some(0), &lines).unwrap();
+        assert_eq!(inserted.tree_skeleton().len(), 5);
+        assert_eq!(inserted.get_node(1).unwrap().text, "// a\n");
+        assert_eq!(inserted.get_node(2).unwrap().text, "// b\n");
+    }
+
+    #[test]
+    fn insert_lines_roundtrip() {
+        let file = sample_file();
+        let lines = vec!["    let z = 99;\n".to_owned()];
+        let inserted = file.insert_lines(Some(0), &lines).unwrap();
+        let text = inserted.to_text();
+        assert_eq!(
+            text,
+            "fn main() {\n    let z = 99;\n    println!(\"hello\");\n}\n"
+        );
+    }
+
+    #[test]
+    fn insert_lines_out_of_range() {
+        let file = sample_file();
+        assert!(file.insert_lines(Some(99), &["x\n".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn insert_lines_empty_input() {
+        let file = sample_file();
+        assert!(file.insert_lines(None, &[]).is_err());
+    }
+
+    #[test]
+    fn insert_lines_preserves_language() {
+        let file = sample_file();
+        let inserted = file
+            .insert_lines(Some(0), &["    let y = 2;\n".to_owned()])
+            .unwrap();
+        assert_eq!(inserted.language(), FileLanguage::Rust);
+        let tokens = inserted.get_line_tokens(1).unwrap();
+        assert!(tokens.iter().any(|t| t.kind == "Keyword" && t.text == "let"));
+    }
+
+    // --- delete_lines ---
+
+    #[test]
+    fn delete_single_line() {
+        let file = sample_file(); // lines: fn / println / }
+        let deleted = file.delete_lines(1, 1).unwrap();
+        assert_eq!(deleted.version, 1);
+        assert_eq!(deleted.tree_skeleton().len(), 2);
+        assert_eq!(deleted.get_node(0).unwrap().text, "fn main() {\n");
+        assert_eq!(deleted.get_node(1).unwrap().text, "}\n");
+    }
+
+    #[test]
+    fn delete_first_line() {
+        let file = sample_file();
+        let deleted = file.delete_lines(0, 1).unwrap();
+        assert_eq!(deleted.tree_skeleton().len(), 2);
+        assert_eq!(deleted.get_node(0).unwrap().text, "    println!(\"hello\");\n");
+    }
+
+    #[test]
+    fn delete_last_line() {
+        let file = sample_file();
+        let deleted = file.delete_lines(2, 1).unwrap();
+        assert_eq!(deleted.tree_skeleton().len(), 2);
+        assert_eq!(deleted.get_node(1).unwrap().text, "    println!(\"hello\");\n");
+    }
+
+    #[test]
+    fn delete_all_lines() {
+        let file = sample_file();
+        let deleted = file.delete_lines(0, 3).unwrap();
+        assert_eq!(deleted.tree_skeleton().len(), 0);
+        assert_eq!(deleted.to_text(), "");
+    }
+
+    #[test]
+    fn delete_multiple_lines_roundtrip() {
+        // File: fn / println / } — delete lines 0 and 1 (keep only })
+        let file = sample_file();
+        let deleted = file.delete_lines(0, 2).unwrap();
+        assert_eq!(deleted.to_text(), "}\n");
+    }
+
+    #[test]
+    fn delete_lines_out_of_range_start() {
+        let file = sample_file();
+        assert!(file.delete_lines(99, 1).is_err());
+    }
+
+    #[test]
+    fn delete_lines_exceeds_length() {
+        let file = sample_file(); // 3 lines, start at 2 with count 2 → end index 4 > 3
+        assert!(file.delete_lines(2, 2).is_err());
+    }
+
+    #[test]
+    fn delete_lines_zero_count() {
+        let file = sample_file();
+        assert!(file.delete_lines(0, 0).is_err());
+    }
+
+    #[test]
+    fn delete_preserves_language() {
+        let file = sample_file();
+        let deleted = file.delete_lines(1, 1).unwrap();
+        assert_eq!(deleted.language(), FileLanguage::Rust);
+    }
+
+    // --- surgical rebuild correctness ---
+
+    #[test]
+    fn replace_node_is_surgical_lossless() {
+        let file = sample_file();
+        let updated = file.replace_node(1, "    let x = 42;").unwrap();
+        // Verify full round-trip text.
+        assert_eq!(
+            updated.to_text(),
+            "fn main() {\n    let x = 42;\n}\n"
+        );
+        // Verify token kinds on edited line.
+        let tokens = updated.get_line_tokens(1).unwrap();
+        assert!(tokens.iter().any(|t| t.kind == "Keyword" && t.text == "let"));
+    }
+
+    #[test]
+    fn successive_mutations_increment_version() {
+        let file = sample_file();
+        let v1 = file.replace_node(0, "fn foo() {").unwrap();
+        let v2 = v1
+            .insert_lines(Some(0), &["    // comment\n".to_owned()])
+            .unwrap();
+        let v3 = v2.delete_lines(2, 1).unwrap();
+        assert_eq!(file.version, 0);
+        assert_eq!(v1.version, 1);
+        assert_eq!(v2.version, 2);
+        assert_eq!(v3.version, 3);
     }
 }

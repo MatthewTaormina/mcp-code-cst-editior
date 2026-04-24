@@ -411,3 +411,183 @@ fn edit_preserves_rust_token_structure() {
     assert_eq!(edited.get_node(2).unwrap().text, "}\n");
 }
 
+// ---------------------------------------------------------------------------
+// Phase 4: insert_lines and delete_lines (structural mutations)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn integration_insert_at_start() {
+    let src = "fn main() {\n}\n";
+    let file = CstFile::parse(PathBuf::from("g.rs"), src);
+    let inserted = file
+        .insert_lines(None, &["    // body\n".to_owned()])
+        .unwrap();
+    assert_eq!(inserted.tree_skeleton().len(), 3);
+    assert_eq!(inserted.get_node(0).unwrap().text, "    // body\n");
+    assert_eq!(inserted.get_node(1).unwrap().text, "fn main() {\n");
+}
+
+#[test]
+fn integration_insert_and_delete_roundtrip() {
+    let src = "a\nb\nc\n";
+    let file = CstFile::parse(PathBuf::from("h.txt"), src);
+
+    // Insert "x\n" after line 1 → a / b / x / c
+    let with_x = file
+        .insert_lines(Some(1), &["x\n".to_owned()])
+        .unwrap();
+    assert_eq!(with_x.to_text(), "a\nb\nx\nc\n");
+
+    // Delete the original "c" line (now at index 3)
+    let without_c = with_x.delete_lines(3, 1).unwrap();
+    assert_eq!(without_c.to_text(), "a\nb\nx\n");
+}
+
+#[test]
+fn integration_delete_then_insert() {
+    let src = "fn a() {}\nfn b() {}\nfn c() {}\n";
+    let file = CstFile::parse(PathBuf::from("i.rs"), src);
+
+    // Delete middle function.
+    let del = file.delete_lines(1, 1).unwrap();
+    assert_eq!(del.to_text(), "fn a() {}\nfn c() {}\n");
+
+    // Re-insert a replacement.
+    let ins = del
+        .insert_lines(Some(0), &["fn b_new() {}\n".to_owned()])
+        .unwrap();
+    assert_eq!(ins.to_text(), "fn a() {}\nfn b_new() {}\nfn c() {}\n");
+}
+
+#[test]
+fn integration_insert_lines_conflict_guard() {
+    let mut state = ServerState::new();
+    let path = PathBuf::from("/tmp/test_insert_conflict.rs");
+    let file = CstFile::parse(path.clone(), "fn a() {}\n");
+    state.track(path.clone(), file);
+
+    // Simulate a watcher reload bumping the version to 1.
+    let current = state.get(&path).unwrap();
+    let reloaded = current.replace_node(0, "fn a_reloaded() {}").unwrap();
+    state.track(path.clone(), reloaded);
+
+    // Caller still holds expected_version = 0; the conflict is detectable.
+    let stored = state.get(&path).unwrap();
+    let expected: u64 = 0;
+    assert_ne!(stored.version, expected, "version mismatch must be detectable");
+}
+
+#[test]
+fn integration_delete_all_lines_then_insert() {
+    let file = CstFile::parse(PathBuf::from("j.rs"), "fn a() {}\nfn b() {}\n");
+    let empty = file.delete_lines(0, 2).unwrap();
+    assert_eq!(empty.to_text(), "");
+    assert_eq!(empty.tree_skeleton().len(), 0);
+
+    let restored = empty
+        .insert_lines(None, &["fn c() {}\n".to_owned()])
+        .unwrap();
+    assert_eq!(restored.to_text(), "fn c() {}\n");
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: concurrent AI edit + watcher stress test
+// ---------------------------------------------------------------------------
+
+/// Simulate the primary Phase 4 safety scenario: an AI assistant performing
+/// repeated edits on a file while the filesystem watcher concurrently reloads
+/// it from external writes.
+///
+/// The invariant is that every `insert_lines` call either:
+///   (a) succeeds and produces a monotonically higher version, or
+///   (b) would be detected as a conflict if `expected_version` had been used.
+///
+/// We don't test the MCP tool layer here (it would require wiring up a full
+/// server); instead we exercise the underlying state machine directly using
+/// the same code path the tool handlers use.
+#[tokio::test]
+async fn concurrent_ai_edit_and_watcher_reload() {
+    let (_tmp, path) = make_temp_file("fn original() {}\n");
+    let (state, handle) = setup().await;
+
+    // Start tracking and watching.
+    let content = std::fs::read_to_string(&path).unwrap();
+    let file = CstFile::parse(path.clone(), &content);
+    state.write().await.track(path.clone(), file);
+    watch_path(&handle, &path).unwrap();
+
+    // Spawn a background task that writes to the file 5 times with 80 ms gaps.
+    let path_clone = path.clone();
+    let writer = tokio::spawn(async move {
+        for i in 0_u32..5 {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            let src = format!("fn version_{i}() {{}}\n");
+            std::fs::write(&path_clone, src).unwrap();
+        }
+    });
+
+    // Concurrently perform 10 insert_lines attempts from the "AI" side.
+    // Each attempt reads the current version and inserts a comment line.
+    let mut successes = 0_u32;
+    for _ in 0_u32..10 {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let (current_version, line_count) = {
+            let s = state.read().await;
+            if let Some(f) = s.get(&path) {
+                (f.version, f.tree_skeleton().len())
+            } else {
+                continue;
+            }
+        };
+
+        // Attempt to insert a comment after the first line (if the file has any).
+        if line_count == 0 {
+            continue;
+        }
+        let insert_after = if line_count > 0 { Some(0u32) } else { None };
+
+        let new_file_result = {
+            let s = state.read().await;
+            s.get(&path).and_then(|f| {
+                // Only proceed if the version we read is still current.
+                if f.version == current_version {
+                    f.insert_lines(insert_after, &["// ai comment\n".to_owned()]).ok()
+                } else {
+                    None // Would be a conflict — skip this round.
+                }
+            })
+        };
+
+        if let Some(new_file) = new_file_result {
+            // Write lock: commit only if no one changed the version under us.
+            let mut s = state.write().await;
+            if let Some(existing) = s.get(&path) {
+                if existing.version == current_version {
+                    let committed_version = new_file.version;
+                    s.track(path.clone(), new_file);
+                    successes += 1;
+                    // Version must have incremented.
+                    assert!(
+                        committed_version > current_version,
+                        "committed version must be > prior version"
+                    );
+                }
+                // else: watcher raced us — skip (correct conflict avoidance)
+            }
+        }
+    }
+
+    writer.await.unwrap();
+
+    // At least some AI edits must have succeeded given the timing parameters.
+    assert!(successes > 0, "at least one AI edit should succeed");
+
+    // Final version must be >= the number of watcher reloads + AI successes.
+    let final_version = state.read().await.get(&path).unwrap().version;
+    assert!(
+        final_version >= successes.into(),
+        "final version {final_version} should be at least {successes}"
+    );
+}
+

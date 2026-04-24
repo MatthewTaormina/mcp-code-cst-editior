@@ -244,6 +244,58 @@ save_file(path)
 
 ---
 
+### `insert_lines`
+
+Insert one or more new lines at a position in a tracked file's CST.
+
+All existing lines are preserved verbatim.  A trailing `\n` is auto-appended
+to any line that lacks one.  Uses rowan's native `splice_children` — unchanged
+Line nodes are shared without re-parsing.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `path` | `string` | Absolute path of the tracked file |
+| `insert_after` | `integer \| null` | Line index after which to insert. `null` (or omit) to prepend at the start |
+| `lines` | `string[]` | One or more new line strings to insert |
+| `expected_version` | `integer?` | *Optional.* Conflict guard (same semantics as `edit_node`) |
+
+**Returns:** JSON on success, `"conflict: …"` or `"error: …"` on failure.
+
+```json
+{
+  "inserted_count": 1,
+  "first_node_id": 1,
+  "version": 2
+}
+```
+
+**Example — insert a comment between lines 0 and 1:**
+
+```
+insert_lines(path, insert_after=0, lines=["    // inserted comment\n"], expected_version=V)
+```
+
+---
+
+### `delete_lines`
+
+Delete one or more consecutive Line nodes from a tracked file's CST.
+
+All remaining lines are preserved verbatim.  Deleted node IDs are compacted —
+the node that was at `node_id + count` becomes `node_id` after the call.  Uses
+rowan's native `splice_children`.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `path` | `string` | Absolute path of the tracked file |
+| `node_id` | `integer` | 0-based index of the first line to delete |
+| `count` | `integer` | Number of consecutive lines to remove (≥ 1) |
+| `expected_version` | `integer?` | *Optional.* Conflict guard (same semantics as `edit_node`) |
+
+**Returns:** `"ok: deleted N line(s) …"` on success, `"conflict: …"` or `"error: …"` on failure.
+
+---
+
 ### `save_file`
 
 Flush the in-memory CST back to disk (lossless round-trip).
@@ -265,9 +317,9 @@ src/
   lexer.rs       — lossless Rust token lexer; plain-text fallback
   state.rs       — ServerState: versioned HashMap<PathBuf, CstFile>
   watcher.rs     — notify watcher; auto-reloads tracked files on disk change
-  tools.rs       — 9 MCP tools exposed via #[tool_router(server_handler)]
+  tools.rs       — 11 MCP tools exposed via #[tool_router(server_handler)]
 tests/
-  integration.rs — 23 integration tests (watcher, conflict, token-level)
+  integration.rs — 29 integration tests (watcher, conflict, token-level, concurrent)
 scripts/
   setup-inotify.sh — raise inotify limits on Debian/Mint (run once, sudo)
 ```
@@ -275,6 +327,6 @@ scripts/
 ## Testing
 
 ```bash
-cargo test          # run all 62 tests (unit + integration)
+cargo test          # run all 88 tests (unit + integration)
 cargo build         # verify binary compiles
 ```

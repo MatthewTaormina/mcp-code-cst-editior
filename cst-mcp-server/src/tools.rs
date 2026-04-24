@@ -79,6 +79,37 @@ pub struct GetLineTokensParams {
     pub node_id: u32,
 }
 
+/// Parameters for `insert_lines`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct InsertLinesParams {
+    /// Absolute path of the tracked file to modify.
+    pub path: String,
+    /// 0-based index of the line *after which* the new lines are inserted.
+    /// Omit (or pass `null`) to prepend at the beginning of the file.
+    pub insert_after: Option<u32>,
+    /// One or more line strings to insert.  A trailing `\n` is appended
+    /// automatically to any string that lacks one.
+    pub lines: Vec<String>,
+    /// If provided, the edit is rejected when the file's actual version
+    /// differs from this value (optimistic concurrency control).
+    pub expected_version: Option<u64>,
+}
+
+/// Parameters for `delete_lines`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DeleteLinesParams {
+    /// Absolute path of the tracked file to modify.
+    pub path: String,
+    /// 0-based index of the first line to delete.
+    pub node_id: u32,
+    /// Number of consecutive lines to remove starting at `node_id`.
+    /// Must be at least 1.
+    pub count: u32,
+    /// If provided, the edit is rejected when the file's actual version
+    /// differs from this value (optimistic concurrency control).
+    pub expected_version: Option<u64>,
+}
+
 /// Parameters for `list_tracked_files` (no fields — lists all tracked paths).
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListTrackedFilesParams {}
@@ -428,6 +459,134 @@ impl CstMcpServer {
                     Ok(()) => format!("ok: saved {path:?} (CST version {version})"),
                     Err(e) => format!("error: could not write {path:?}: {e}"),
                 }
+            }
+        }
+    }
+
+    /// Insert one or more new lines at a position in a tracked file's CST.
+    ///
+    /// Lines are inserted *after* `insert_after` (0-based line index).  Set
+    /// `insert_after` to `null` (or omit it) to prepend lines at the
+    /// beginning of the file.  Trailing `\n` is added automatically to any
+    /// line that lacks one.
+    ///
+    /// All existing lines — including their whitespace and comments — are
+    /// preserved verbatim.  The insertion uses rowan's native `splice_children`
+    /// so unchanged Line nodes are shared without re-parsing.
+    ///
+    /// Pass `expected_version` (from a prior `get_node` or `load_file`) to
+    /// guard against concurrent external file changes.
+    #[tool(
+        description = "Insert one or more new lines into the CST of a tracked file. \
+                        insert_after=null prepends at start; insert_after=N inserts after line N. \
+                        Returns JSON: {inserted_count, first_node_id, version}."
+    )]
+    async fn insert_lines(
+        &self,
+        Parameters(InsertLinesParams {
+            path,
+            insert_after,
+            lines,
+            expected_version,
+        }): Parameters<InsertLinesParams>,
+    ) -> String {
+        let path = PathBuf::from(&path);
+
+        let new_file = {
+            let state = self.state.read().await;
+            match state.get(&path) {
+                None => return format!("error: {path:?} is not tracked — call track_file first"),
+                Some(file) => {
+                    if let Some(expected) = expected_version {
+                        if file.version != expected {
+                            return format!(
+                                "conflict: {path:?} is at version {} but expected version {} — \
+                                 re-read the file with load_file or get_node and retry",
+                                file.version, expected
+                            );
+                        }
+                    }
+                    file.insert_lines(insert_after, &lines)
+                }
+            }
+        };
+
+        match new_file {
+            Err(e) => format!("error: {e}"),
+            Ok(new_file) => {
+                let version = new_file.version;
+                let inserted_count = lines.len();
+                let first_node_id: u32 = match insert_after {
+                    None => 0,
+                    Some(id) => id + 1,
+                };
+                self.state.write().await.track(path.clone(), new_file);
+                serde_json::json!({
+                    "inserted_count": inserted_count,
+                    "first_node_id": first_node_id,
+                    "version": version,
+                })
+                .to_string()
+            }
+        }
+    }
+
+    /// Delete one or more consecutive Line nodes from a tracked file's CST.
+    ///
+    /// `node_id` is the 0-based index of the first line to remove.  `count`
+    /// specifies how many consecutive lines to delete (minimum 1).  All
+    /// remaining lines are preserved verbatim and their `node_id`s are
+    /// compacted down to fill the gap.
+    ///
+    /// The deletion uses rowan's native `splice_children` so unchanged Line
+    /// nodes are shared without re-parsing.
+    ///
+    /// Pass `expected_version` (from a prior `get_node` or `load_file`) to
+    /// guard against concurrent external file changes.
+    #[tool(
+        description = "Delete one or more consecutive line nodes from the CST of a tracked file. \
+                        node_id is the first line to delete; count is how many to remove (≥ 1). \
+                        Returns ok: or conflict: or error: string."
+    )]
+    async fn delete_lines(
+        &self,
+        Parameters(DeleteLinesParams {
+            path,
+            node_id,
+            count,
+            expected_version,
+        }): Parameters<DeleteLinesParams>,
+    ) -> String {
+        let path = PathBuf::from(&path);
+
+        let new_file = {
+            let state = self.state.read().await;
+            match state.get(&path) {
+                None => return format!("error: {path:?} is not tracked — call track_file first"),
+                Some(file) => {
+                    if let Some(expected) = expected_version {
+                        if file.version != expected {
+                            return format!(
+                                "conflict: {path:?} is at version {} but expected version {} — \
+                                 re-read the file with load_file or get_node and retry",
+                                file.version, expected
+                            );
+                        }
+                    }
+                    file.delete_lines(node_id, count)
+                }
+            }
+        };
+
+        match new_file {
+            Err(e) => format!("error: {e}"),
+            Ok(new_file) => {
+                let version = new_file.version;
+                self.state.write().await.track(path.clone(), new_file);
+                format!(
+                    "ok: deleted {count} line(s) starting at node {node_id} in {path:?} \
+                     (CST version {version})"
+                )
             }
         }
     }
