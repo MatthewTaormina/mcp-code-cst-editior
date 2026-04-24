@@ -18,16 +18,26 @@ export interface DiagnosticNode {
 export class LxTree {
   readonly languageId: string;
   readonly source: string;
+  /**
+   * Monotonically-increasing version number. A freshly parsed tree starts at 0; each
+   * successful patch produces a new tree with `version + 1`. Used for optimistic locking.
+   */
+  readonly version: number;
 
   /** Internal native tree-sitter tree. Public for advanced consumers; do not mutate. */
   readonly nativeTree: TSTree;
 
+  /** Language definition this tree was parsed with. Internal use. */
+  readonly _language: LanguageDef;
+
   private _root: LxNode | null = null;
 
-  constructor(language: LanguageDef, source: string, nativeTree: TSTree) {
+  constructor(language: LanguageDef, source: string, nativeTree: TSTree, version = 0) {
     this.languageId = language.id;
     this.source = source;
     this.nativeTree = nativeTree;
+    this.version = version;
+    this._language = language;
   }
 
   /** Materialize and cache the full LxNode tree. */
