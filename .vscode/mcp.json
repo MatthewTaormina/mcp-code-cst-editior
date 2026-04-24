@@ -1,0 +1,12 @@
+{
+  "servers": {
+    "cst-mcp-server": {
+      "type": "stdio",
+      "command": "${workspaceFolder}/target/release/cst-mcp-server.exe",
+      "args": [
+        "--workspace-path",
+        "${workspaceFolder}"
+      ]
+    }
+  }
+}
