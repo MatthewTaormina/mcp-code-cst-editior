@@ -89,9 +89,9 @@ pub struct DeleteNodeParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListTrackedFilesParams {}
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CreateFileParams {
     pub path: String,
-    pub content: Option<String>,
     pub track: Option<bool>,
 }
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -237,10 +237,10 @@ impl CstMcpServer {
         serde_json::json!({ "count": files.len(), "files": files }).to_string()
     }
     // --- File management ---
-    #[tool(description = "Create a new file on disk. Set track=true to immediately load it. Returns ok or error.")]
+    #[tool(description = "Create a new empty file on disk. Set track=true to immediately load it. Returns ok or error.")]
     async fn create_file(
         &self,
-        Parameters(CreateFileParams { path, content, track }): Parameters<CreateFileParams>,
+        Parameters(CreateFileParams { path, track }): Parameters<CreateFileParams>,
     ) -> String {
         let resolved = match self.access.resolve_and_check("create", &path) {
             Err(e) => return format!("error: {e}"),
@@ -256,8 +256,7 @@ impl CstMcpServer {
                 }
             }
         }
-        let body = content.unwrap_or_default();
-        if let Err(e) = std::fs::write(&resolved, body.as_bytes()) {
+        if let Err(e) = std::fs::write(&resolved, b"") {
             return format!("error: could not write {resolved:?}: {e}");
         }
         let mut msg = format!("ok: created {resolved:?}");
@@ -805,7 +804,7 @@ fn tool_catalog() -> Vec<serde_json::Value> {
         serde_json::json!({"name":"track_file","category":"tracking","description":"Load file into memory as a tree-sitter CST and watch for external changes."}),
         serde_json::json!({"name":"untrack_file","category":"tracking","description":"Remove file from memory and stop watching."}),
         serde_json::json!({"name":"list_tracked_files","category":"tracking","description":"List all tracked files. Returns JSON {count, files}."}),
-        serde_json::json!({"name":"create_file","category":"file_management","description":"Create a new file on disk. set track=true to load immediately.","params":["path","content?","track?"]}),
+        serde_json::json!({"name":"create_file","category":"file_management","description":"Create a new empty file on disk. set track=true to load immediately.","params":["path","track?"]}),
         serde_json::json!({"name":"delete_file","category":"file_management","description":"Delete a file from disk (auto-untracks).","params":["path"]}),
         serde_json::json!({"name":"load_file","category":"inspection","description":"Quick summary: language, line count, root node, version.","params":["path"]}),
         serde_json::json!({"name":"get_tree_skeleton","category":"inspection","description":"Hierarchical JSON of the parse tree. Omit node_id for file root. named_only=true hides punctuation.","params":["path","node_id?","max_depth?","named_only?"]}),

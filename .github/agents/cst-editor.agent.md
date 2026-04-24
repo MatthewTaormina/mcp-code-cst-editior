@@ -48,7 +48,7 @@ All edit tools return `{version, has_errors, errors:[…]}`. **Node IDs are stal
 ### File Management
 | Tool | Purpose |
 |------|---------|
-| `create_file(path, content?, track?)` | Create a new file on disk. Set `track=true` to load immediately. |
+| `create_file(path, track?)` | Create a new empty file on disk. Set `track=true` to load immediately. To add content, follow with `track_file` then editing tools (`insert_into`, `edit_node`, etc.). |
 | `delete_file(path)` | Delete file from disk (auto-untracks). |
 
 ### Help
@@ -66,7 +66,7 @@ All edit tools return `{version, has_errors, errors:[…]}`. **Node IDs are stal
 
 ## Workflow
 
-1. **Prepare** — Create a test directory and write source files using `create_file`.
+1. **Prepare** — Create a test directory and create empty source files with `create_file`. Populate them via `track_file` + editing tools (`insert_into`, `edit_node`). Never embed file content in `create_file` — it does not accept content.
 2. **Load** — `track_file` each file; note the root `node_id` and `version`.
 3. **Inspect** — Use `get_tree_skeleton` (start with `max_depth=3, named_only=true`) to understand structure, then `get_children` to drill into specific nodes.
 4. **Query** (optional) — Use `query_file` with a tree-sitter pattern to locate the exact node to edit.
