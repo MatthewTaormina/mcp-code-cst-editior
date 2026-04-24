@@ -1,229 +1,152 @@
-use std::sync::Arc;
-
+﻿use std::sync::Arc;
 use rmcp::{
     handler::server::wrapper::Parameters, schemars, tool, tool_router,
 };
 use serde::Deserialize;
 use tokio::sync::RwLock;
-
 use crate::access::AccessConfig;
 use crate::cst::CstFile;
 use crate::state::ServerState;
 use crate::watcher::{watch_path, unwatch_path, WatcherHandle};
-
 // ---------------------------------------------------------------------------
-// Parameter structs (each tool's input schema)
+// Parameter structs
 // ---------------------------------------------------------------------------
-
-/// Parameters for `track_file`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct TrackParams {
-    /// Absolute path to the file that should be monitored and held in memory.
     pub path: String,
 }
-
-/// Parameters for `untrack_file`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct UntrackParams {
-    /// Absolute path of the file to remove from active tracking.
     pub path: String,
 }
-
-/// Parameters for `load_file`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct LoadParams {
-    /// Absolute path of the already-tracked file to inspect.
     pub path: String,
 }
-
-/// Parameters for `get_node`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetNodeParams {
-    /// Absolute path of the tracked file.
     pub path: String,
-    /// 0-based line index of the node to retrieve.
-    pub node_id: u32,
+    /// Node ID returned by get_tree_skeleton, get_children, or root_node_id.
+    pub node_id: u64,
 }
-
-/// Parameters for `get_tree_skeleton`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SkeletonParams {
-    /// Absolute path of the tracked file to inspect.
     pub path: String,
+    /// Start the skeleton from this node (omit for file root).
+    pub node_id: Option<u64>,
+    /// Maximum recursion depth (default 3).
+    pub max_depth: Option<u32>,
+    /// When true, omit anonymous punctuation/keyword nodes (default false).
+    pub named_only: Option<bool>,
 }
-
-/// Parameters for `edit_node`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct EditParams {
-    /// Absolute path of the tracked file to edit.
+pub struct GetChildrenParams {
     pub path: String,
-    /// 0-based line index of the node (line) to replace.
-    pub node_id: u32,
-    /// New text content for the target line (without a trailing newline;
-    /// the server preserves the original line-ending).
+    pub node_id: u64,
+    /// When true, return only named (semantic) children (default false).
+    pub named_only: Option<bool>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct EditNodeParams {
+    pub path: String,
+    pub node_id: u64,
+    /// Replacement source text for the node's entire span.
     pub new_text: String,
-    /// If provided, the edit is only applied when the file's current CST
-    /// version matches this value.  Use this to detect conflicts: obtain the
-    /// version from a prior `load_file` or `get_node` call, and pass it here
-    /// so the server can reject the edit if the file was reloaded by the
-    /// watcher (or by another edit) in the meantime.
     pub expected_version: Option<u64>,
 }
-
-/// Parameters for `get_line_tokens`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct GetLineTokensParams {
-    /// Absolute path of the tracked file.
+pub struct InsertBeforeParams {
     pub path: String,
-    /// 0-based line index of the node whose tokens should be returned.
-    pub node_id: u32,
-}
-
-/// Parameters for `insert_lines`.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct InsertLinesParams {
-    /// Absolute path of the tracked file to modify.
-    pub path: String,
-    /// 0-based index of the line *after which* the new lines are inserted.
-    /// Omit (or pass `null`) to prepend at the beginning of the file.
-    pub insert_after: Option<u32>,
-    /// One or more line strings to insert.  A trailing `\n` is appended
-    /// automatically to any string that lacks one.
-    pub lines: Vec<String>,
-    /// If provided, the edit is rejected when the file's actual version
-    /// differs from this value (optimistic concurrency control).
+    pub node_id: u64,
+    /// Text to insert immediately before the node.
+    pub text: String,
     pub expected_version: Option<u64>,
 }
-
-/// Parameters for `delete_lines`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct DeleteLinesParams {
-    /// Absolute path of the tracked file to modify.
+pub struct InsertAfterParams {
     pub path: String,
-    /// 0-based index of the first line to delete.
-    pub node_id: u32,
-    /// Number of consecutive lines to remove starting at `node_id`.
-    /// Must be at least 1.
-    pub count: u32,
-    /// If provided, the edit is rejected when the file's actual version
-    /// differs from this value (optimistic concurrency control).
+    pub node_id: u64,
+    /// Text to insert immediately after the node.
+    pub text: String,
     pub expected_version: Option<u64>,
 }
-
-/// Parameters for `list_tracked_files` (no fields — lists all tracked paths).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct InsertIntoParams {
+    pub path: String,
+    pub node_id: u64,
+    /// Text to insert inside the node.
+    pub text: String,
+    /// `"start"` to insert at the node's first byte, `"end"` for last byte (default `"end"`).
+    pub position: Option<String>,
+    pub expected_version: Option<u64>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DeleteNodeParams {
+    pub path: String,
+    pub node_id: u64,
+    pub expected_version: Option<u64>,
+}
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListTrackedFilesParams {}
-
-/// Parameters for `create_file`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CreateFileParams {
-    /// Absolute path of the file to create (must be inside the workspace).
     pub path: String,
-    /// Initial content for the new file.  Defaults to empty if omitted.
     pub content: Option<String>,
-    /// When `true`, the newly-created file is automatically tracked in memory
-    /// after it is written to disk.  Defaults to `false`.
     pub track: Option<bool>,
 }
-
-/// Parameters for `delete_file`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DeleteFileParams {
-    /// Absolute path of the file to delete (must be inside the workspace).
     pub path: String,
 }
-
-/// Parameters for `save_file`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SaveParams {
-    /// Absolute path of the tracked file to flush to disk.
     pub path: String,
 }
-
-// ── Phase 6: query + help ────────────────────────────────────────────────────
-
-/// Parameters for `query_file`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct QueryFileParams {
-    /// Path to the tracked file to query (absolute or workspace-relative).
     pub path: String,
-    /// Structured query expression — see `query_tool` for full documentation.
-    pub query: crate::cst::QueryExpr,
+    /// A tree-sitter s-expression pattern with captures.
+    /// Example: `"(function_item name: (identifier) @fn_name)"`
+    pub ts_query: String,
+    /// Maximum number of capture matches to return (omit for no limit).
+    pub max_matches: Option<usize>,
 }
-
-/// Optional graph-search specification (reserved for future use).
-///
-/// When graph search is implemented, this will allow expressing relationship
-/// queries such as "files that import symbol X", "callers of function Y", or
-/// "modules reachable from entry point Z".  The schema will be stabilised in a
-/// future release; pass `null` or omit this field to use the current text/
-/// semantic search behaviour.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct GraphQuery {
-    /// Relationship kind to traverse (e.g. `"imports"`, `"calls"`,
-    /// `"references"`).  Reserved — not yet evaluated.
-    pub relation: Option<String>,
-    /// Starting file or symbol for the graph traversal.  Reserved.
-    pub from: Option<String>,
-    /// Maximum edge hops to follow.  Reserved.
-    pub max_depth: Option<u32>,
-}
-
-/// Parameters for `query_workspace`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct QueryWorkspaceParams {
-    /// Structured query to run against every tracked file.
-    pub query: crate::cst::QueryExpr,
-    /// Graph search specification.  Currently reserved for future use — pass
-    /// `null` or omit.  When graph search is implemented this will allow
-    /// relationship-aware queries across the tracked file set (import graphs,
-    /// call graphs, reference chains, etc.).
-    pub graph: Option<GraphQuery>,
+    /// Same tree-sitter s-expression query as query_file.
+    pub ts_query: String,
+    /// Cap on total matches returned across all files.
+    pub max_matches: Option<usize>,
 }
-
-/// Parameters for `query_tool` (help / tool catalog).
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct QueryToolParams {
-    /// Name of the specific tool to look up (`"track_file"`, `"query_file"`,
-    /// …).  Omit to receive the full catalog plus a tool-selection guide.
     pub tool_name: Option<String>,
 }
-
 // ---------------------------------------------------------------------------
 // Server struct
 // ---------------------------------------------------------------------------
-
-/// The MCP server handler that exposes CST editing capabilities as tools.
 #[derive(Clone)]
 pub struct CstMcpServer {
     state: Arc<RwLock<ServerState>>,
     watcher: WatcherHandle,
     access: Arc<AccessConfig>,
 }
-
 impl CstMcpServer {
     pub fn new(
         state: Arc<RwLock<ServerState>>,
         watcher: WatcherHandle,
         access: Arc<AccessConfig>,
     ) -> Self {
-        Self {
-            state,
-            watcher,
-            access,
-        }
+        Self { state, watcher, access }
     }
 }
-
 // ---------------------------------------------------------------------------
 // Tool implementations
 // ---------------------------------------------------------------------------
-
 #[tool_router(server_handler)]
 impl CstMcpServer {
-    /// Begin tracking a file: read it from disk, parse it into the in-memory
-    /// CST, and register it with the filesystem watcher for auto-reload.
-    #[tool(description = "Track a file: load it into memory as a CST and watch for external changes.")]
+    // --- Tracking ---
+    #[tool(description = "Track a file: read it from disk, parse it into a tree-sitter CST, and watch for external changes.")]
     async fn track_file(
         &self,
         Parameters(TrackParams { path }): Parameters<TrackParams>,
@@ -232,25 +155,23 @@ impl CstMcpServer {
             Err(e) => return format!("error: {e}"),
             Ok(p) => p,
         };
-
         match std::fs::read_to_string(&path) {
             Err(e) => format!("error: could not read {path:?}: {e}"),
             Ok(content) => {
                 let file = CstFile::parse(path.clone(), &content);
+                let lang = format!("{:?}", file.language());
+                let root_id = file.root_node_id();
                 self.state.write().await.track(path.clone(), file);
-
-                // Best-effort registration with the watcher; if it fails we
-                // still track the file (manual reloads via `track_file` work).
                 if let Err(e) = watch_path(&self.watcher, &path) {
                     eprintln!("watcher: could not watch {path:?}: {e}");
                 }
-
-                format!("ok: tracking {path:?}")
+                match root_id {
+                    Some(id) => format!("ok: tracking {path:?} ({lang}, root node_id={id})"),
+                    None => format!("ok: tracking {path:?} ({lang}, no parse tree)"),
+                }
             }
         }
     }
-
-    /// Stop tracking a file and release its in-memory CST.
     #[tool(description = "Untrack a file: remove it from memory and stop watching for changes.")]
     async fn untrack_file(
         &self,
@@ -260,10 +181,7 @@ impl CstMcpServer {
             Err(e) => return format!("error: {e}"),
             Ok(p) => p,
         };
-        let removed = self.state.write().await.untrack(&path);
-
-        if removed {
-            // Best-effort deregistration from the watcher.
+        if self.state.write().await.untrack(&path) {
             if let Err(e) = unwatch_path(&self.watcher, &path) {
                 eprintln!("watcher: could not unwatch {path:?}: {e}");
             }
@@ -272,12 +190,7 @@ impl CstMcpServer {
             format!("error: {path:?} was not being tracked")
         }
     }
-
-    /// Return a summary of the in-memory CST for a tracked file.
-    ///
-    /// This includes the number of lines (top-level CST nodes) and the
-    /// current version counter, which increments on every reload or edit.
-    #[tool(description = "Inspect the in-memory CST of a tracked file (line count, version).")]
+    #[tool(description = "Quick summary of a tracked file: language, source size, root node, and version.")]
     async fn load_file(
         &self,
         Parameters(LoadParams { path }): Parameters<LoadParams>,
@@ -287,178 +200,30 @@ impl CstMcpServer {
             Ok(p) => p,
         };
         let state = self.state.read().await;
-
         match state.get(&path) {
             None => format!("error: {path:?} is not tracked — call track_file first"),
             Some(file) => {
-                let text = file.to_text();
-                let line_count = text.lines().count();
-                format!(
-                    "ok: {path:?} — {line_count} lines, CST version {}",
-                    file.version
-                )
-            }
-        }
-    }
-
-    /// Return full metadata for a single CST node (line).
-    ///
-    /// The response is a JSON object with the node's `node_id`, `kind`,
-    /// full `text` (including any trailing newline), byte `span` offsets,
-    /// and the file's current `version`.  Use the `version` field with
-    /// `edit_node`'s `expected_version` parameter to detect edit conflicts.
-    #[tool(
-        description = "Get the text content, kind, and byte-span of a single line node in the CST. \
-                        Returns JSON. Use the returned version with edit_node to avoid conflicts."
-    )]
-    async fn get_node(
-        &self,
-        Parameters(GetNodeParams { path, node_id }): Parameters<GetNodeParams>,
-    ) -> String {
-        let path = match self.access.resolve_and_check("read", &path) {
-            Err(e) => return format!("error: {e}"),
-            Ok(p) => p,
-        };
-        let state = self.state.read().await;
-
-        match state.get(&path) {
-            None => format!("error: {path:?} is not tracked — call track_file first"),
-            Some(file) => match file.get_node(node_id) {
-                Err(e) => format!("error: {e}"),
-                Ok(info) => {
-                    let version = file.version;
-                    serde_json::json!({
-                        "node_id": info.node_id,
-                        "kind": info.kind,
-                        "text": info.text,
-                        "span": { "start": info.span_start, "end": info.span_end },
-                        "version": version,
-                    })
-                    .to_string()
-                }
-            },
-        }
-    }
-
-    /// Return a structural listing of all line nodes in a tracked file's CST.
-    ///
-    /// The response is a JSON array, one object per line, each containing
-    /// `node_id`, `kind`, `text_preview` (truncated), byte `span`, and the
-    /// file's current `version`.  Use this to navigate the file before
-    /// calling `get_node` or `edit_node`.
-    #[tool(
-        description = "List all CST line nodes with their IDs, spans, and text previews. \
-                        Returns a JSON array. Use node_id values with get_node or edit_node."
-    )]
-    async fn get_tree_skeleton(
-        &self,
-        Parameters(SkeletonParams { path }): Parameters<SkeletonParams>,
-    ) -> String {
-        let path = match self.access.resolve_and_check("read", &path) {
-            Err(e) => return format!("error: {e}"),
-            Ok(p) => p,
-        };
-        let state = self.state.read().await;
-
-        match state.get(&path) {
-            None => format!("error: {path:?} is not tracked — call track_file first"),
-            Some(file) => {
-                let version = file.version;
-                let nodes: Vec<_> = file
-                    .tree_skeleton()
-                    .into_iter()
-                    .map(|info| {
-                        serde_json::json!({
-                            "node_id": info.node_id,
-                            "kind": info.kind,
-                            "text_preview": info.text_preview(),
-                            "span": { "start": info.span_start, "end": info.span_end },
-                        })
-                    })
-                    .collect();
-
-                serde_json::json!({
-                    "version": version,
-                    "nodes": nodes,
-                })
-                .to_string()
-            }
-        }
-    }
-
-    /// Replace the content of one line (identified by its 0-based `node_id`)
-    /// inside a tracked file's in-memory CST.
-    ///
-    /// All other lines — including their whitespace and comments — are
-    /// preserved verbatim (lossless round-trip via rowan).
-    ///
-    /// If `expected_version` is supplied, the edit is rejected with a
-    /// `"conflict"` response when the file's actual version differs.  This
-    /// protects against clobbering a watcher-triggered reload that happened
-    /// between your `load_file`/`get_node` call and this `edit_node` call.
-    #[tool(
-        description = "Edit a single line node in the CST of a tracked file. All other lines are \
-                        preserved verbatim.  Pass expected_version (from get_node or load_file) to \
-                        guard against concurrent external file changes."
-    )]
-    async fn edit_node(
-        &self,
-        Parameters(EditParams {
-            path,
-            node_id,
-            new_text,
-            expected_version,
-        }): Parameters<EditParams>,
-    ) -> String {
-        let path = match self.access.resolve_and_check("edit", &path) {
-            Err(e) => return format!("error: {e}"),
-            Ok(p) => p,
-        };
-
-        // Build the new CST outside of the write lock to minimise hold time.
-        let new_file = {
-            let state = self.state.read().await;
-            match state.get(&path) {
-                None => return format!("error: {path:?} is not tracked — call track_file first"),
-                Some(file) => {
-                    // Version conflict detection: if the caller supplied an
-                    // expected_version and it doesn't match the actual version,
-                    // the file was modified (by the watcher or another edit)
-                    // since the caller last read it.
-                    if let Some(expected) = expected_version {
-                        if file.version != expected {
-                            return format!(
-                                "conflict: {path:?} is at version {} but expected version {} — \
-                                 re-read the file with load_file or get_node and retry",
-                                file.version, expected
-                            );
-                        }
+                let line_count = file.to_text().lines().count();
+                let lang = format!("{:?}", file.language());
+                match file.root_node_id() {
+                    None => format!(
+                        "ok: {path:?} — {lang}, {line_count} lines, no parse tree, version {}",
+                        file.version
+                    ),
+                    Some(root_id) => {
+                        let children = file.get_children(root_id, true)
+                            .map(|c| c.len())
+                            .unwrap_or(0);
+                        format!(
+                            "ok: {path:?} — {lang}, {line_count} lines, root={root_id} ({children} named children), version {}",
+                            file.version
+                        )
                     }
-                    file.replace_node(node_id, &new_text)
                 }
-            }
-        };
-
-        match new_file {
-            Err(e) => format!("error: {e}"),
-            Ok(new_file) => {
-                let version = new_file.version;
-                self.state.write().await.track(path.clone(), new_file);
-                format!("ok: node {node_id} in {path:?} updated (CST version {version})")
             }
         }
     }
-
-    /// Return a sorted list of every file currently held in memory.
-    ///
-    /// The response is a JSON object with a `count` field and a `files` array
-    /// of absolute path strings.  Use this to check which files are available
-    /// for inspection or editing without making a separate `load_file` call
-    /// for each candidate.
-    #[tool(
-        description = "List all files currently tracked in memory. \
-                        Returns JSON: {count, files: [sorted absolute paths]}."
-    )]
+    #[tool(description = "List all files currently tracked in memory. Returns JSON: {count, files}.")]
     async fn list_tracked_files(
         &self,
         Parameters(ListTrackedFilesParams {}): Parameters<ListTrackedFilesParams>,
@@ -469,75 +234,72 @@ impl CstMcpServer {
             .into_iter()
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
-
-        serde_json::json!({
-            "count": files.len(),
-            "files": files,
-        })
-        .to_string()
+        serde_json::json!({ "count": files.len(), "files": files }).to_string()
     }
-
-    /// Return the token-level children of a single Line node.
-    ///
-    /// For `.rs` files, each token carries a semantic `kind` — one of
-    /// `"Keyword"`, `"Identifier"`, `"Literal"`, `"Comment"`,
-    /// `"Whitespace"`, `"Newline"`, or `"Punctuation"`.  For all other file
-    /// types each line contains a single `"Text"` token (the same as the
-    /// plain-text grammar used before language-specific lexing was added).
-    ///
-    /// Use `get_tree_skeleton` to discover valid `node_id` values, then call
-    /// this tool to inspect sub-line token structure.
-    #[tool(
-        description = "Get the token-level children of a Line node in the CST. \
-                        Returns JSON: {line_node_id, language, tokens: [{token_idx, kind, text, span}], version}. \
-                        Kind values for .rs files: Keyword | Identifier | Literal | Comment | Whitespace | Newline | Punctuation."
-    )]
-    async fn get_line_tokens(
+    // --- File management ---
+    #[tool(description = "Create a new file on disk. Set track=true to immediately load it. Returns ok or error.")]
+    async fn create_file(
         &self,
-        Parameters(GetLineTokensParams { path, node_id }): Parameters<GetLineTokensParams>,
+        Parameters(CreateFileParams { path, content, track }): Parameters<CreateFileParams>,
     ) -> String {
-        let path = match self.access.resolve_and_check("read", &path) {
+        let resolved = match self.access.resolve_and_check("create", &path) {
             Err(e) => return format!("error: {e}"),
             Ok(p) => p,
         };
-        let state = self.state.read().await;
-
-        match state.get(&path) {
-            None => format!("error: {path:?} is not tracked — call track_file first"),
-            Some(file) => match file.get_line_tokens(node_id) {
-                Err(e) => format!("error: {e}"),
-                Ok(tokens) => {
-                    let version = file.version;
-                    let lang = format!("{:?}", file.language());
-                    let token_values: Vec<_> = tokens
-                        .iter()
-                        .map(|t| {
-                            serde_json::json!({
-                                "token_idx": t.token_idx,
-                                "kind": t.kind,
-                                "text": t.text,
-                                "span": { "start": t.span_start, "end": t.span_end },
-                            })
-                        })
-                        .collect();
-
-                    serde_json::json!({
-                        "line_node_id": node_id,
-                        "language": lang,
-                        "tokens": token_values,
-                        "version": version,
-                    })
-                    .to_string()
+        if resolved.exists() {
+            return format!("error: {resolved:?} already exists");
+        }
+        if let Some(parent) = resolved.parent() {
+            if !parent.exists() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    return format!("error: could not create directories for {resolved:?}: {e}");
                 }
-            },
+            }
+        }
+        let body = content.unwrap_or_default();
+        if let Err(e) = std::fs::write(&resolved, body.as_bytes()) {
+            return format!("error: could not write {resolved:?}: {e}");
+        }
+        let mut msg = format!("ok: created {resolved:?}");
+        if track.unwrap_or(false) {
+            match std::fs::read_to_string(&resolved) {
+                Err(e) => msg.push_str(&format!("; warning: track failed: {e}")),
+                Ok(text) => {
+                    let file = CstFile::parse(resolved.clone(), &text);
+                    self.state.write().await.track(resolved.clone(), file);
+                    if let Err(e) = watch_path(&self.watcher, &resolved) {
+                        eprintln!("watcher: {e}");
+                    }
+                    msg.push_str("; tracking");
+                }
+            }
+        }
+        msg
+    }
+    #[tool(description = "Delete a file from disk. Auto-untracks if currently tracked. Returns ok or error.")]
+    async fn delete_file(
+        &self,
+        Parameters(DeleteFileParams { path }): Parameters<DeleteFileParams>,
+    ) -> String {
+        let resolved = match self.access.resolve_and_check("delete_file", &path) {
+            Err(e) => return format!("error: {e}"),
+            Ok(p) => p,
+        };
+        if !resolved.exists() {
+            return format!("error: {resolved:?} does not exist");
+        }
+        let was_tracked = self.state.write().await.untrack(&resolved);
+        if was_tracked {
+            if let Err(e) = unwatch_path(&self.watcher, &resolved) {
+                eprintln!("watcher: {e}");
+            }
+        }
+        match std::fs::remove_file(&resolved) {
+            Ok(()) => format!("ok: deleted {resolved:?}"),
+            Err(e) => format!("error: could not delete {resolved:?}: {e}"),
         }
     }
-
-    /// Flush the current in-memory CST for a tracked file back to disk.
-    ///
-    /// The file is reconstructed from the rowan tree, guaranteeing a lossless
-    /// round-trip for all unedited content.
-    #[tool(description = "Save the in-memory CST of a tracked file to disk (lossless round-trip).")]
+    #[tool(description = "Flush the in-memory CST back to disk (lossless). Returns ok or error.")]
     async fn save_file(
         &self,
         Parameters(SaveParams { path }): Parameters<SaveParams>,
@@ -547,15 +309,12 @@ impl CstMcpServer {
             Ok(p) => p,
         };
         let state = self.state.read().await;
-
         match state.get(&path) {
             None => format!("error: {path:?} is not tracked — call track_file first"),
             Some(file) => {
-                let text = file.to_text();
+                let text = file.to_text().to_string();
                 let version = file.version;
-                // Drop the read lock before the (potentially slow) write.
                 drop(state);
-
                 match std::fs::write(&path, text.as_bytes()) {
                     Ok(()) => format!("ok: saved {path:?} (CST version {version})"),
                     Err(e) => format!("error: could not write {path:?}: {e}"),
@@ -563,295 +322,285 @@ impl CstMcpServer {
             }
         }
     }
-
-    /// Insert one or more new lines at a position in a tracked file's CST.
+    // --- Inspection ---
+    /// Return rich metadata for a single tree-sitter node identified by its ID.
     ///
-    /// Lines are inserted *after* `insert_after` (0-based line index).  Set
-    /// `insert_after` to `null` (or omit it) to prepend lines at the
-    /// beginning of the file.  Trailing `\n` is added automatically to any
-    /// line that lacks one.
-    ///
-    /// All existing lines — including their whitespace and comments — are
-    /// preserved verbatim.  The insertion uses rowan's native `splice_children`
-    /// so unchanged Line nodes are shared without re-parsing.
-    ///
-    /// Pass `expected_version` (from a prior `get_node` or `load_file`) to
-    /// guard against concurrent external file changes.
+    /// Node IDs come from `get_tree_skeleton`, `get_children`, or the root_node_id
+    /// shown in `track_file` / `load_file` responses.  IDs are valid only for the
+    /// current version — re-query after any edit.
     #[tool(
-        description = "Insert one or more new lines into the CST of a tracked file. \
-                        insert_after=null prepends at start; insert_after=N inserts after line N. \
-                        Returns JSON: {inserted_count, first_node_id, version}."
+        description = "Get metadata for one CST node: kind, text_preview, row/col, byte offsets, \
+                        child count. Returns JSON. node_id comes from get_tree_skeleton or get_children."
     )]
-    async fn insert_lines(
+    async fn get_node(
         &self,
-        Parameters(InsertLinesParams {
-            path,
-            insert_after,
-            lines,
-            expected_version,
-        }): Parameters<InsertLinesParams>,
+        Parameters(GetNodeParams { path, node_id }): Parameters<GetNodeParams>,
     ) -> String {
-        let path = match self.access.resolve_and_check("insert", &path) {
+        let path = match self.access.resolve_and_check("read", &path) {
             Err(e) => return format!("error: {e}"),
             Ok(p) => p,
         };
-
+        let state = self.state.read().await;
+        match state.get(&path) {
+            None => format!("error: {path:?} is not tracked — call track_file first"),
+            Some(file) => match file.get_node(node_id) {
+                Err(e) => format!("error: {e}"),
+                Ok(info) => serde_json::json!({
+                    "node_id": info.node_id,
+                    "kind": info.kind,
+                    "text_preview": info.text_preview,
+                    "start_row": info.start_row,
+                    "start_col": info.start_col,
+                    "end_row": info.end_row,
+                    "end_col": info.end_col,
+                    "start_byte": info.start_byte,
+                    "end_byte": info.end_byte,
+                    "is_named": info.is_named,
+                    "has_error": info.has_error,
+                    "named_child_count": info.named_child_count,
+                    "version": file.version,
+                }).to_string(),
+            },
+        }
+    }
+    /// Return a hierarchical JSON view of the parse tree starting from a
+    /// given node (or the file root).
+    ///
+    /// Use this to understand the file's structure before navigating to a
+    /// specific node for editing.  Increase `max_depth` (default 3) to see
+    /// deeper subtrees.  Set `named_only=true` to hide punctuation tokens and
+    /// get a cleaner view.
+    #[tool(
+        description = "Hierarchical JSON view of the parse tree. \
+                        Omit node_id to start from the file root. \
+                        Returns {node_id, kind, text_preview, children:[…], version}."
+    )]
+    async fn get_tree_skeleton(
+        &self,
+        Parameters(SkeletonParams { path, node_id, max_depth, named_only }): Parameters<SkeletonParams>,
+    ) -> String {
+        let path = match self.access.resolve_and_check("read", &path) {
+            Err(e) => return format!("error: {e}"),
+            Ok(p) => p,
+        };
+        let state = self.state.read().await;
+        match state.get(&path) {
+            None => format!("error: {path:?} is not tracked — call track_file first"),
+            Some(file) => {
+                let only_named = named_only.unwrap_or(false);
+                match file.get_tree_skeleton(node_id, max_depth, only_named) {
+                    Err(e) => format!("error: {e}"),
+                    Ok(mut tree) => {
+                        tree["version"] = serde_json::json!(file.version);
+                        tree.to_string()
+                    }
+                }
+            }
+        }
+    }
+    /// Return the direct children of a node, with field names and previews.
+    ///
+    /// Field names (like `"name"`, `"body"`, `"parameters"`) indicate how a
+    /// child relates to its parent in the grammar.  Use the returned `node_id`
+    /// values with `get_node`, `edit_node`, `insert_before`, etc.
+    #[tool(
+        description = "List the direct children of a CST node with field names and previews. \
+                        Returns JSON {children:[{node_id, kind, field_name, text_preview, …}], version}."
+    )]
+    async fn get_children(
+        &self,
+        Parameters(GetChildrenParams { path, node_id, named_only }): Parameters<GetChildrenParams>,
+    ) -> String {
+        let path = match self.access.resolve_and_check("read", &path) {
+            Err(e) => return format!("error: {e}"),
+            Ok(p) => p,
+        };
+        let state = self.state.read().await;
+        match state.get(&path) {
+            None => format!("error: {path:?} is not tracked — call track_file first"),
+            Some(file) => {
+                let only_named = named_only.unwrap_or(false);
+                match file.get_children(node_id, only_named) {
+                    Err(e) => format!("error: {e}"),
+                    Ok(children) => {
+                        let arr: Vec<_> = children.iter().map(|c| serde_json::json!({
+                            "node_id": c.node_id,
+                            "kind": c.kind,
+                            "field_name": c.field_name,
+                            "text_preview": c.text_preview,
+                            "start_row": c.start_row,
+                            "start_col": c.start_col,
+                            "named_child_count": c.named_child_count,
+                            "has_error": c.has_error,
+                        })).collect();
+                        serde_json::json!({
+                            "node_id": node_id,
+                            "child_count": arr.len(),
+                            "children": arr,
+                            "version": file.version,
+                        }).to_string()
+                    }
+                }
+            }
+        }
+    }
+    // --- Editing ---
+    /// Replace the entire source span of a CST node with new text.
+    ///
+    /// The file is re-parsed after the edit.  All node IDs in the response
+    /// are stale — re-query with `get_tree_skeleton` or `get_children`.
+    ///
+    /// Pass `expected_version` (from a prior `get_node` or `load_file`) to
+    /// detect conflicts caused by concurrent watcher reloads.
+    #[tool(
+        description = "Replace the source span of any CST node with new_text. Re-parses the file. \
+                        Node IDs are stale after this call — re-query. \
+                        Returns JSON {version, has_errors, errors:[…]} or conflict/error string."
+    )]
+    async fn edit_node(
+        &self,
+        Parameters(EditNodeParams { path, node_id, new_text, expected_version }): Parameters<EditNodeParams>,
+    ) -> String {
+        let path = match self.access.resolve_and_check("edit", &path) {
+            Err(e) => return format!("error: {e}"),
+            Ok(p) => p,
+        };
         let new_file = {
             let state = self.state.read().await;
             match state.get(&path) {
                 None => return format!("error: {path:?} is not tracked — call track_file first"),
-                Some(file) => {
-                    if let Some(expected) = expected_version {
-                        if file.version != expected {
-                            return format!(
-                                "conflict: {path:?} is at version {} but expected version {} — \
-                                 re-read the file with load_file or get_node and retry",
-                                file.version, expected
-                            );
-                        }
-                    }
-                    file.insert_lines(insert_after, &lines)
-                }
+                Some(file) => file.replace_node(node_id, &new_text, expected_version),
             }
         };
-
-        match new_file {
-            Err(e) => format!("error: {e}"),
-            Ok(new_file) => {
-                let version = new_file.version;
-                let inserted_count = lines.len();
-                let first_node_id: u32 = match insert_after {
-                    None => 0,
-                    Some(id) => id + 1,
-                };
-                self.state.write().await.track(path.clone(), new_file);
-                serde_json::json!({
-                    "inserted_count": inserted_count,
-                    "first_node_id": first_node_id,
-                    "version": version,
-                })
-                .to_string()
-            }
-        }
+        self.apply_edit(path, new_file).await
     }
-
-    /// Delete one or more consecutive Line nodes from a tracked file's CST.
-    ///
-    /// `node_id` is the 0-based index of the first line to remove.  `count`
-    /// specifies how many consecutive lines to delete (minimum 1).  All
-    /// remaining lines are preserved verbatim and their `node_id`s are
-    /// compacted down to fill the gap.
-    ///
-    /// The deletion uses rowan's native `splice_children` so unchanged Line
-    /// nodes are shared without re-parsing.
-    ///
-    /// Pass `expected_version` (from a prior `get_node` or `load_file`) to
-    /// guard against concurrent external file changes.
+    /// Insert text immediately before a CST node.
     #[tool(
-        description = "Delete one or more consecutive line nodes from the CST of a tracked file. \
-                        node_id is the first line to delete; count is how many to remove (≥ 1). \
-                        Returns ok: or conflict: or error: string."
+        description = "Insert text immediately before a node. Re-parses the file. \
+                        Returns JSON {version, has_errors, errors:[…]} or conflict/error string."
     )]
-    async fn delete_lines(
+    async fn insert_before(
         &self,
-        Parameters(DeleteLinesParams {
-            path,
-            node_id,
-            count,
-            expected_version,
-        }): Parameters<DeleteLinesParams>,
+        Parameters(InsertBeforeParams { path, node_id, text, expected_version }): Parameters<InsertBeforeParams>,
     ) -> String {
-        let path = match self.access.resolve_and_check("delete", &path) {
+        let path = match self.access.resolve_and_check("edit", &path) {
             Err(e) => return format!("error: {e}"),
             Ok(p) => p,
         };
-
         let new_file = {
             let state = self.state.read().await;
             match state.get(&path) {
                 None => return format!("error: {path:?} is not tracked — call track_file first"),
-                Some(file) => {
-                    if let Some(expected) = expected_version {
-                        if file.version != expected {
-                            return format!(
-                                "conflict: {path:?} is at version {} but expected version {} — \
-                                 re-read the file with load_file or get_node and retry",
-                                file.version, expected
-                            );
-                        }
-                    }
-                    file.delete_lines(node_id, count)
-                }
+                Some(file) => file.insert_before_node(node_id, &text, expected_version),
             }
         };
-
-        match new_file {
-            Err(e) => format!("error: {e}"),
-            Ok(new_file) => {
-                let version = new_file.version;
-                self.state.write().await.track(path.clone(), new_file);
-                format!(
-                    "ok: deleted {count} line(s) starting at node {node_id} in {path:?} \
-                     (CST version {version})"
-                )
-            }
-        }
+        self.apply_edit(path, new_file).await
     }
-
-    /// Create a new file on disk inside the workspace.
-    ///
-    /// The file is written with the provided `content` (or empty if omitted).
-    /// If `track` is `true`, the file is also loaded into the in-memory CST
-    /// immediately (equivalent to calling `track_file` afterwards).
-    ///
-    /// Returns an error if the file already exists or if the path is outside
-    /// the workspace root.
+    /// Insert text immediately after a CST node.
     #[tool(
-        description = "Create a new file on disk inside the workspace with optional initial content. \
-                        Set track=true to immediately load it into memory. \
-                        Returns \"ok: created <path>\" or \"error: …\"."
+        description = "Insert text immediately after a node. Re-parses the file. \
+                        Returns JSON {version, has_errors, errors:[…]} or conflict/error string."
     )]
-    async fn create_file(
+    async fn insert_after(
         &self,
-        Parameters(CreateFileParams { path, content, track }): Parameters<CreateFileParams>,
+        Parameters(InsertAfterParams { path, node_id, text, expected_version }): Parameters<InsertAfterParams>,
     ) -> String {
-        let resolved = match self.access.resolve_and_check("create", &path) {
+        let path = match self.access.resolve_and_check("edit", &path) {
             Err(e) => return format!("error: {e}"),
             Ok(p) => p,
         };
-
-        // Refuse to overwrite an existing file.
-        if resolved.exists() {
-            return format!("error: {resolved:?} already exists");
-        }
-
-        // Create parent directories if necessary.
-        if let Some(parent) = resolved.parent() {
-            if !parent.exists() {
-                if let Err(e) = std::fs::create_dir_all(parent) {
-                    return format!("error: could not create parent directories for {resolved:?}: {e}");
-                }
+        let new_file = {
+            let state = self.state.read().await;
+            match state.get(&path) {
+                None => return format!("error: {path:?} is not tracked — call track_file first"),
+                Some(file) => file.insert_after_node(node_id, &text, expected_version),
             }
-        }
-
-        let body = content.unwrap_or_default();
-        if let Err(e) = std::fs::write(&resolved, body.as_bytes()) {
-            return format!("error: could not write {resolved:?}: {e}");
-        }
-
-        let mut msg = format!("ok: created {resolved:?}");
-
-        // Optionally track the new file immediately.
-        if track.unwrap_or(false) {
-            match std::fs::read_to_string(&resolved) {
-                Err(e) => {
-                    msg.push_str(&format!("; warning: track failed: {e}"));
-                }
-                Ok(text) => {
-                    let file = CstFile::parse(resolved.clone(), &text);
-                    self.state.write().await.track(resolved.clone(), file);
-                    if let Err(e) = watch_path(&self.watcher, &resolved) {
-                        eprintln!("watcher: could not watch {resolved:?}: {e}");
-                    }
-                    msg.push_str("; tracking");
-                }
-            }
-        }
-
-        msg
+        };
+        self.apply_edit(path, new_file).await
     }
-
-    /// Delete a file from disk.
+    /// Insert text inside a node — at its start or end.
     ///
-    /// If the file is currently tracked it is automatically untracked (and
-    /// unwatched) before deletion so the in-memory state stays consistent.
-    ///
-    /// Returns an error if the file does not exist or is outside the
-    /// workspace root.
+    /// Use `position="end"` (default) to append at the end of a block body,
+    /// or `position="start"` to prepend.  For inserting inside a function body
+    /// without disturbing the braces, target the block node.
     #[tool(
-        description = "Delete a file from disk inside the workspace. \
-                        If the file is currently tracked it is automatically untracked first. \
-                        Returns \"ok: deleted <path>\" or \"error: …\"."
+        description = "Insert text inside a node at its start or end (default end). \
+                        Useful for adding statements to a block body. \
+                        Returns JSON {version, has_errors, errors:[…]} or conflict/error string."
     )]
-    async fn delete_file(
+    async fn insert_into(
         &self,
-        Parameters(DeleteFileParams { path }): Parameters<DeleteFileParams>,
+        Parameters(InsertIntoParams { path, node_id, text, position, expected_version }): Parameters<InsertIntoParams>,
     ) -> String {
-        let resolved = match self.access.resolve_and_check("delete_file", &path) {
+        let path = match self.access.resolve_and_check("edit", &path) {
             Err(e) => return format!("error: {e}"),
             Ok(p) => p,
         };
-
-        if !resolved.exists() {
-            return format!("error: {resolved:?} does not exist");
-        }
-
-        // Untrack first so in-memory state stays consistent.
-        let was_tracked = self.state.write().await.untrack(&resolved);
-        if was_tracked {
-            if let Err(e) = unwatch_path(&self.watcher, &resolved) {
-                eprintln!("watcher: could not unwatch {resolved:?}: {e}");
+        let at_start = position.as_deref() == Some("start");
+        let new_file = {
+            let state = self.state.read().await;
+            match state.get(&path) {
+                None => return format!("error: {path:?} is not tracked — call track_file first"),
+                Some(file) => file.insert_into_node(node_id, &text, at_start, expected_version),
             }
-        }
-
-        match std::fs::remove_file(&resolved) {
-            Ok(()) => format!("ok: deleted {resolved:?}"),
-            Err(e) => format!("error: could not delete {resolved:?}: {e}"),
-        }
+        };
+        self.apply_edit(path, new_file).await
     }
-
-    /// Query the CST of a single tracked file using structured filters,
-    /// semantic patterns, and scope-depth constraints.
+    /// Delete a CST node's source span entirely.
+    #[tool(
+        description = "Delete the source span of a CST node. Re-parses the file. \
+                        Returns JSON {version, has_errors, errors:[…]} or conflict/error string."
+    )]
+    async fn delete_node(
+        &self,
+        Parameters(DeleteNodeParams { path, node_id, expected_version }): Parameters<DeleteNodeParams>,
+    ) -> String {
+        let path = match self.access.resolve_and_check("edit", &path) {
+            Err(e) => return format!("error: {e}"),
+            Ok(p) => p,
+        };
+        let new_file = {
+            let state = self.state.read().await;
+            match state.get(&path) {
+                None => return format!("error: {path:?} is not tracked — call track_file first"),
+                Some(file) => file.delete_node(node_id, expected_version),
+            }
+        };
+        self.apply_edit(path, new_file).await
+    }
+    // --- Query ---
+    /// Run a tree-sitter s-expression query against a tracked file and return
+    /// all capture matches.
     ///
-    /// ## Filters
+    /// ## Query syntax
     ///
-    /// All filter fields in `query` are optional and AND-ed together.
+    /// Uses tree-sitter's standard s-expression query language.  Every
+    /// capture must be named with `@name`.
     ///
-    /// **Text / kind filters** (`kind`, `text_contains`, `text_glob`) match
-    /// the text of a line or token.  `kind` is case-insensitive.
-    ///
-    /// **Line-range filter** (`node_id_from`, `node_id_to`) restricts the
-    /// search to a contiguous block of lines.
-    ///
-    /// **Depth** (`depth`) selects `"line"` (default) or `"token"` level.
-    ///
-    /// **Semantic patterns** (`semantic`) find named syntactic constructs in
-    /// Rust files and return a `capture` (function name, variable name, …):
-    /// `fn_def`, `struct_def`, `enum_def`, `trait_def`, `impl_block`,
-    /// `type_def`, `variable_def`, `use_stmt`, `macro_call`.
-    ///
-    /// **Identifier search** (`identifier_name`) finds every token-level
-    /// occurrence of an exact identifier name.
-    ///
-    /// **Scope-depth filters** (`scope_depth_min`, `scope_depth_max`) restrict
-    /// results to a specific brace-nesting level (0 = top-level).  Combine
-    /// with `semantic` to get, e.g., only top-level function definitions:
-    /// `{"semantic":"fn_def","scope_depth_max":0}`.
-    ///
-    /// ## Response JSON
-    ///
-    /// ```json
-    /// {
-    ///   "file": "/abs/path",
-    ///   "language": "Rust",
-    ///   "version": 1,
-    ///   "match_count": 2,
-    ///   "matches": [
-    ///     { "node_id":0, "kind":"Line", "text":"fn main() {\n",
-    ///       "span_start":0, "span_end":12, "scope_depth":0,
-    ///       "capture":"main" }
-    ///   ]
-    /// }
     /// ```
+    /// # Rust: find all function names
+    /// (function_item name: (identifier) @fn_name)
+    ///
+    /// # JavaScript: find all variable declarators
+    /// (variable_declarator name: (identifier) @var_name)
+    ///
+    /// # CSS: find all class selectors
+    /// (class_selector (class_name) @class)
+    ///
+    /// # HTML: find all element tags
+    /// (element (start_tag (tag_name) @tag))
+    /// ```
+    ///
+    /// Use `get_tree_skeleton` to explore the node kinds available in the
+    /// file before writing a query.
     #[tool(
-        description = "Query the CST of a tracked file with text, semantic, identifier, and \
-                        scope-depth filters.  Returns JSON: {file, language, version, \
-                        match_count, matches:[{node_id,kind,text,span_start,span_end,\
-                        scope_depth,token_idx?,capture?}]}."
+        description = "Run a tree-sitter s-expression query on a tracked file and return captures. \
+                        Example: `(function_item name: (identifier) @fn_name)` \
+                        Returns JSON {file, language, version, match_count, matches:[{capture_name, node_id, kind, text_preview, start_row, start_col, end_row, end_col}]}."
     )]
     async fn query_file(
         &self,
-        Parameters(QueryFileParams { path, query }): Parameters<QueryFileParams>,
+        Parameters(QueryFileParams { path, ts_query, max_matches }): Parameters<QueryFileParams>,
     ) -> String {
         let path = match self.access.resolve_and_check("query", &path) {
             Err(e) => return format!("error: {e}"),
@@ -860,148 +609,98 @@ impl CstMcpServer {
         let state = self.state.read().await;
         match state.get(&path) {
             None => format!("error: {path:?} is not tracked — call track_file first"),
-            Some(file) => {
-                let matches = file.query(&query);
-                let match_count = matches.len();
-                let lang = format!("{:?}", file.language());
-                let version = file.version;
-                let match_values: Vec<_> = matches
-                    .into_iter()
-                    .map(|m| {
-                        let mut obj = serde_json::json!({
-                            "node_id": m.node_id,
-                            "kind": m.kind,
-                            "text": m.text,
-                            "span_start": m.span_start,
-                            "span_end": m.span_end,
-                            "scope_depth": m.scope_depth,
-                        });
-                        if let Some(tidx) = m.token_idx {
-                            obj["token_idx"] = serde_json::json!(tidx);
-                        }
-                        if let Some(cap) = m.capture {
-                            obj["capture"] = serde_json::json!(cap);
-                        }
-                        obj
-                    })
-                    .collect();
-
-                serde_json::json!({
-                    "file": path.to_string_lossy(),
-                    "language": lang,
-                    "version": version,
-                    "match_count": match_count,
-                    "matches": match_values,
-                })
-                .to_string()
+            Some(file) => match file.query_ts(&ts_query, max_matches) {
+                Err(e) => format!("error: {e}"),
+                Ok(matches) => {
+                    let match_count = matches.len();
+                    let match_values: Vec<_> = matches.iter().map(|m| serde_json::json!({
+                        "capture_name": m.capture_name,
+                        "node_id": m.node_id,
+                        "kind": m.kind,
+                        "text_preview": m.text_preview,
+                        "start_row": m.start_row,
+                        "start_col": m.start_col,
+                        "end_row": m.end_row,
+                        "end_col": m.end_col,
+                    })).collect();
+                    serde_json::json!({
+                        "file": path.to_string_lossy(),
+                        "language": format!("{:?}", file.language()),
+                        "version": file.version,
+                        "match_count": match_count,
+                        "matches": match_values,
+                    }).to_string()
+                }
             }
         }
     }
-
-    /// Run the same query across every tracked file in the workspace.
-    ///
-    /// The `query` field accepts exactly the same expression as `query_file`.
-    /// Results are grouped by file and include per-file `version` and
-    /// `match_count`.  Files with zero matches are omitted from the output.
-    ///
-    /// ## Graph search (future)
-    ///
-    /// The `graph` field is reserved for a planned cross-file relationship
-    /// search layer (import graphs, call graphs, reference chains).  Pass
-    /// `null` or omit it — it is accepted but ignored in the current release.
-    ///
-    /// ## Response JSON
-    ///
-    /// ```json
-    /// {
-    ///   "total_files_searched": 3,
-    ///   "files_with_matches": 1,
-    ///   "total_matches": 2,
-    ///   "results": [
-    ///     { "file": "/abs/path/a.rs", "language": "Rust", "version": 0,
-    ///       "match_count": 2, "matches": [ … ] }
-    ///   ]
-    /// }
-    /// ```
+    /// Run the same tree-sitter query across every tracked file and aggregate
+    /// results.  Files without a parse tree (plain text) or with a grammar
+    /// mismatch are silently skipped.
     #[tool(
-        description = "Run a query across all tracked files in the workspace.  Same query \
-                        expression as query_file.  The `graph` field is reserved for future \
-                        cross-file relationship search (import/call graphs).  Returns JSON: \
-                        {total_files_searched, files_with_matches, total_matches, results:[…]}."
+        description = "Run a tree-sitter query across all tracked files. \
+                        Same query syntax as query_file. \
+                        Returns JSON {total_files_searched, files_with_matches, total_matches, results:[…]}."
     )]
     async fn query_workspace(
         &self,
-        Parameters(QueryWorkspaceParams { query, graph: _ }): Parameters<QueryWorkspaceParams>,
+        Parameters(QueryWorkspaceParams { ts_query, max_matches }): Parameters<QueryWorkspaceParams>,
     ) -> String {
         let state = self.state.read().await;
         let paths = state.tracked_paths();
-        let total_files_searched = paths.len();
+        let total_files = paths.len();
         let mut results: Vec<serde_json::Value> = Vec::new();
         let mut total_matches: usize = 0;
-
-        for path in paths {
+        let mut remaining = max_matches;
+        'files: for path in paths {
             if let Some(file) = state.get(&path) {
-                let matches = file.query(&query);
-                if matches.is_empty() {
-                    continue;
+                let limit = remaining;
+                let matches = match file.query_ts(&ts_query, limit) {
+                    Ok(m) if !m.is_empty() => m,
+                    _ => continue,
+                };
+                if let Some(r) = remaining.as_mut() {
+                    if *r <= matches.len() {
+                        *r = 0;
+                    } else {
+                        *r -= matches.len();
+                    }
                 }
                 total_matches += matches.len();
-                let lang = format!("{:?}", file.language());
-                let version = file.version;
-                let match_count = matches.len();
-                let match_values: Vec<_> = matches
-                    .into_iter()
-                    .map(|m| {
-                        let mut obj = serde_json::json!({
-                            "node_id": m.node_id,
-                            "kind": m.kind,
-                            "text": m.text,
-                            "span_start": m.span_start,
-                            "span_end": m.span_end,
-                            "scope_depth": m.scope_depth,
-                        });
-                        if let Some(tidx) = m.token_idx {
-                            obj["token_idx"] = serde_json::json!(tidx);
-                        }
-                        if let Some(cap) = m.capture {
-                            obj["capture"] = serde_json::json!(cap);
-                        }
-                        obj
-                    })
-                    .collect();
-
+                let mc = matches.len();
+                let match_values: Vec<_> = matches.iter().map(|m| serde_json::json!({
+                    "capture_name": m.capture_name,
+                    "node_id": m.node_id,
+                    "kind": m.kind,
+                    "text_preview": m.text_preview,
+                    "start_row": m.start_row,
+                    "start_col": m.start_col,
+                    "end_row": m.end_row,
+                    "end_col": m.end_col,
+                })).collect();
                 results.push(serde_json::json!({
                     "file": path.to_string_lossy(),
-                    "language": lang,
-                    "version": version,
-                    "match_count": match_count,
+                    "language": format!("{:?}", file.language()),
+                    "version": file.version,
+                    "match_count": mc,
                     "matches": match_values,
                 }));
+                if remaining == Some(0) {
+                    break 'files;
+                }
             }
         }
-
         serde_json::json!({
-            "total_files_searched": total_files_searched,
+            "total_files_searched": total_files,
             "files_with_matches": results.len(),
             "total_matches": total_matches,
             "results": results,
-        })
-        .to_string()
+        }).to_string()
     }
-
-    /// Return documentation and tool-selection guidance for this MCP server.
-    ///
-    /// When `tool_name` is omitted, returns the complete tool catalog plus a
-    /// categorised selection guide.  When `tool_name` is provided, returns
-    /// detailed documentation for that one tool.
-    ///
-    /// Use this tool whenever you are unsure which tool to call next, or when
-    /// you need parameter details, example queries, or a reminder of available
-    /// semantic patterns.
+    // --- Help ---
     #[tool(
-        description = "Get documentation and tool-selection guidance.  Omit tool_name for the \
-                        full catalog + selection guide.  Provide tool_name for focused docs on \
-                        one tool.  Call this when unsure which tool to use."
+        description = "Get documentation and selection guidance. Omit tool_name for the full \
+                        catalog. Provide tool_name for focused docs on one tool."
     )]
     async fn query_tool(
         &self,
@@ -1013,244 +712,113 @@ impl CstMcpServer {
                 "selection_guide": SELECTION_GUIDE,
                 "tool_count": catalog.len(),
                 "tools": catalog,
-            })
-            .to_string(),
+            }).to_string(),
             Some(name) => match catalog.iter().find(|t| t["name"] == name) {
                 Some(entry) => entry.to_string(),
                 None => {
-                    let names: Vec<_> = catalog
-                        .iter()
+                    let names: Vec<_> = catalog.iter()
                         .filter_map(|t| t["name"].as_str())
                         .collect();
-                    format!(
-                        "error: unknown tool {:?}.  Available: {}",
-                        name,
-                        names.join(", ")
-                    )
+                    format!("error: unknown tool {:?}. Available: {}", name, names.join(", "))
                 }
             },
         }
     }
 }
-
+// ---------------------------------------------------------------------------
+// Helper — apply an edit result and store the new CstFile
+// ---------------------------------------------------------------------------
+impl CstMcpServer {
+    async fn apply_edit(
+        &self,
+        path: std::path::PathBuf,
+        result: anyhow::Result<CstFile>,
+    ) -> String {
+        match result {
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("conflict") {
+                    msg
+                } else {
+                    format!("error: {msg}")
+                }
+            }
+            Ok(new_file) => {
+                let version = new_file.version;
+                let errors = new_file.get_errors();
+                let has_errors = !errors.is_empty();
+                self.state.write().await.track(path, new_file);
+                serde_json::json!({
+                    "version": version,
+                    "has_errors": has_errors,
+                    "errors": errors,
+                }).to_string()
+            }
+        }
+    }
+}
 // ---------------------------------------------------------------------------
 // Static tool catalog used by query_tool
 // ---------------------------------------------------------------------------
-
 const SELECTION_GUIDE: &str = "\
 TRACKING — before reading or editing a file you must track it:\
-\n  1. track_file        → loads file, starts watching for external changes\
+\n  1. track_file        → loads file into memory, parses CST, starts watcher\
 \n  2. list_tracked_files → see what is already tracked\
 \n  3. untrack_file      → release a file from memory\
 \
 \nFILE MANAGEMENT — create or delete files on disk:\
-\n  4. create_file       → create a new file (optionally with content; set track=true to load it immediately)\
-\n  5. delete_file       → delete a file from disk (auto-untracks if it was tracked)\
+\n  4. create_file       → create file (set track=true to load immediately)\
+\n  5. delete_file       → delete file (auto-untracks if tracked)\
 \
-\nINSPECTION — explore a tracked file:\
-\n  6. load_file         → quick summary: line count + version\
-\n  7. get_tree_skeleton → all line node_ids with text previews and spans\
-\n  8. get_node          → full text + span for one line (use node_id from skeleton)\
-\n  9. get_line_tokens   → token-level breakdown of one line (Rust files: keyword/ident/…)\
+\nINSPECTION — explore a tracked file's CST:\
+\n  6. load_file         → quick summary: language, line count, root node, version\
+\n  7. get_tree_skeleton → hierarchical JSON view of the parse tree (start at root or node_id)\
+\n  8. get_node          → metadata for one node: kind, row/col, byte offsets, child count\
+\n  9. get_children      → direct children of a node with field names (name, body, params…)\
 \
-\nQUERY — find content by pattern (no need to track first, works on already-tracked files):\
-\n 10. query_file        → text, semantic, identifier, or scope-depth search in one file\
-\n 11. query_workspace   → same query across all tracked files; reserved `graph` field for\
-\n                          future cross-file import/call-graph search\
+\nQUERY — find nodes using tree-sitter s-expression syntax:\
+\n 10. query_file        → pattern match in one file, returns captured nodes\
+\n 11. query_workspace   → same query across all tracked files\
+\n     Example: (function_item name: (identifier) @fn_name)\
 \
 \nEDITING — mutate the in-memory CST (always pass expected_version to guard conflicts):\
-\n 12. edit_node         → replace one line\
-\n 13. insert_lines      → insert one or more lines at a position\
-\n 14. delete_lines      → remove one or more consecutive lines\
-\n 15. save_file         → flush in-memory CST back to disk\
+\n 12. edit_node         → replace a node's entire source span\
+\n 13. insert_before     → insert text immediately before a node\
+\n 14. insert_after      → insert text immediately after a node\
+\n 15. insert_into       → insert text inside a node (at start or end of its span)\
+\n 16. delete_node       → delete a node's source span entirely\
+\n 17. save_file         → flush in-memory CST back to disk\
 \
 \nHELP:\
-\n 16. query_tool        → this tool; get docs for any tool or the full catalog\
+\n 18. query_tool        → this tool; docs for any tool or the full catalog\
 \
 \nTYPICAL WORKFLOW:\
-\n  track_file → query_file (find target) → get_node (read version) → edit_node → save_file\
-\nCREATE WORKFLOW:\
-\n  create_file (track=true) → insert_lines → save_file\
-\nDELETE WORKFLOW:\
-\n  delete_file (auto-untracks)";
-
-
+\n  track_file\
+\n  → get_tree_skeleton            (understand structure)\
+\n  → get_children(fn_node_id)     (find the body block)\
+\n  → insert_into(body_id, text)   (add a statement)\
+\n  → save_file\
+\
+\nAFTER EVERY EDIT: Node IDs are stale. Re-query with get_tree_skeleton or get_children.";
 fn tool_catalog() -> Vec<serde_json::Value> {
     vec![
-        serde_json::json!({
-            "name": "track_file",
-            "category": "tracking",
-            "description": "Load a file from disk into memory, parse it as a CST, and register it with the filesystem watcher for auto-reload.",
-            "parameters": [
-                {"name":"path","type":"string","required":true,"description":"Absolute or workspace-relative path to the file."}
-            ],
-            "returns": "\"ok: tracking <path>\" or \"error: …\"",
-        }),
-        serde_json::json!({
-            "name": "untrack_file",
-            "category": "tracking",
-            "description": "Remove a file from memory and stop watching it for changes.",
-            "parameters": [
-                {"name":"path","type":"string","required":true,"description":"Path of the tracked file to release."}
-            ],
-            "returns": "\"ok: untracked <path>\" or \"error: …\"",
-        }),
-        serde_json::json!({
-            "name": "list_tracked_files",
-            "category": "tracking",
-            "description": "List every file currently held in memory, sorted lexicographically.",
-            "parameters": [],
-            "returns": "JSON {count, files:[sorted absolute paths]}",
-        }),
-        serde_json::json!({
-            "name": "create_file",
-            "category": "file_management",
-            "description": "Create a new file on disk inside the workspace with optional initial content. Set track=true to immediately load the new file into memory. Fails if the file already exists.",
-            "parameters": [
-                {"name":"path","type":"string","required":true,"description":"Absolute or workspace-relative path of the new file."},
-                {"name":"content","type":"string","required":false,"description":"Initial file content. Defaults to empty."},
-                {"name":"track","type":"boolean","required":false,"description":"If true, track the file immediately after creation. Default false."}
-            ],
-            "returns": "\"ok: created <path>\" (with \"; tracking\" suffix when track=true) or \"error: …\"",
-        }),
-        serde_json::json!({
-            "name": "delete_file",
-            "category": "file_management",
-            "description": "Delete a file from disk. If the file is currently tracked it is automatically untracked and unwatched first.",
-            "parameters": [
-                {"name":"path","type":"string","required":true,"description":"Absolute or workspace-relative path of the file to delete."}
-            ],
-            "returns": "\"ok: deleted <path>\" or \"error: …\"",
-        }),
-        serde_json::json!({
-            "name": "load_file",
-            "category": "inspection",
-            "description": "Quick summary of a tracked file: line count and current CST version.",
-            "parameters": [
-                {"name":"path","type":"string","required":true,"description":"Path of the tracked file."}
-            ],
-            "returns": "\"ok: <path> — N lines, CST version V\" or \"error: …\"",
-        }),
-        serde_json::json!({
-            "name": "get_tree_skeleton",
-            "category": "inspection",
-            "description": "List all line (CST node) IDs in a tracked file with text previews and byte spans. Use node_id values with get_node, edit_node, etc.",
-            "parameters": [
-                {"name":"path","type":"string","required":true,"description":"Path of the tracked file."}
-            ],
-            "returns": "JSON {version, nodes:[{node_id,kind,text_preview,span:{start,end}}]}",
-        }),
-        serde_json::json!({
-            "name": "get_node",
-            "category": "inspection",
-            "description": "Get the full text, kind, and byte span of one line node. The returned version should be passed to edit_node as expected_version.",
-            "parameters": [
-                {"name":"path","type":"string","required":true,"description":"Path of the tracked file."},
-                {"name":"node_id","type":"integer","required":true,"description":"0-based line index."}
-            ],
-            "returns": "JSON {node_id, kind, text, span:{start,end}, version}",
-        }),
-        serde_json::json!({
-            "name": "get_line_tokens",
-            "category": "inspection",
-            "description": "Token-level breakdown of a single line. For .rs files: Keyword, Identifier, Literal, Comment, Whitespace, Punctuation, Newline. For plain files: Text.",
-            "parameters": [
-                {"name":"path","type":"string","required":true,"description":"Path of the tracked file."},
-                {"name":"node_id","type":"integer","required":true,"description":"0-based line index."}
-            ],
-            "returns": "JSON {line_node_id, language, tokens:[{token_idx,kind,text,span}], version}",
-        }),
-        serde_json::json!({
-            "name": "query_file",
-            "category": "query",
-            "description": "Search the CST of one tracked file using text, semantic, identifier, and scope-depth filters.",
-            "parameters": [
-                {"name":"path","type":"string","required":true,"description":"Path of the tracked file."},
-                {"name":"query","type":"object","required":true,"description":"QueryExpr — see fields below."}
-            ],
-            "query_fields": {
-                "kind": "Filter by token/line kind (case-insensitive). Line-depth: 'Line'. Token-depth (.rs): Keyword|Identifier|Literal|Comment|Whitespace|Punctuation|Newline.",
-                "text_contains": "Substring match (case-sensitive).",
-                "text_glob": "Glob pattern: * = any chars, ? = one char.",
-                "node_id_from": "First line to consider (0-based, inclusive).",
-                "node_id_to": "Last line to consider (0-based, inclusive).",
-                "depth": "'line' (default) or 'token'. Overridden by semantic/identifier_name.",
-                "semantic": "Named construct: fn_def|struct_def|enum_def|trait_def|impl_block|type_def|variable_def|use_stmt|macro_call. Returns capture (name).",
-                "identifier_name": "Find every token-level occurrence of this exact identifier.",
-                "scope_depth_min": "Only lines at brace depth >= N. 0=top-level.",
-                "scope_depth_max": "Only lines at brace depth <= N."
-            },
-            "examples": [
-                {"description":"All top-level functions","query":{"semantic":"fn_def","scope_depth_max":0}},
-                {"description":"All uses of identifier 'conn'","query":{"identifier_name":"conn"}},
-                {"description":"Lines with TODO","query":{"text_contains":"TODO"}},
-                {"description":"All keyword tokens in first 10 lines","query":{"depth":"token","kind":"Keyword","node_id_to":9}}
-            ],
-            "returns": "JSON {file, language, version, match_count, matches:[{node_id,kind,text,span_start,span_end,scope_depth,token_idx?,capture?}]}",
-        }),
-        serde_json::json!({
-            "name": "query_workspace",
-            "category": "query",
-            "description": "Run the same QueryExpr across all tracked files. Files with zero matches are omitted. The `graph` field is reserved for future cross-file relationship search (import graphs, call graphs, reference chains) — pass null for now.",
-            "parameters": [
-                {"name":"query","type":"object","required":true,"description":"Same QueryExpr as query_file."},
-                {"name":"graph","type":"object|null","required":false,"description":"Reserved for future graph search. Pass null or omit."}
-            ],
-            "returns": "JSON {total_files_searched, files_with_matches, total_matches, results:[{file,language,version,match_count,matches}]}",
-        }),
-        serde_json::json!({
-            "name": "edit_node",
-            "category": "editing",
-            "description": "Replace the text of one line node in a tracked file's CST. All other lines are preserved verbatim. Pass expected_version (from get_node or load_file) to detect conflicts.",
-            "parameters": [
-                {"name":"path","type":"string","required":true},
-                {"name":"node_id","type":"integer","required":true,"description":"0-based line index."},
-                {"name":"new_text","type":"string","required":true,"description":"Replacement text (trailing newline preserved from original)."},
-                {"name":"expected_version","type":"integer","required":false,"description":"Guard against stale edits."}
-            ],
-            "returns": "\"ok: …\" | \"conflict: …\" | \"error: …\"",
-        }),
-        serde_json::json!({
-            "name": "insert_lines",
-            "category": "editing",
-            "description": "Insert one or more new lines into the CST. insert_after=null prepends; insert_after=N inserts after line N. Trailing newline added automatically.",
-            "parameters": [
-                {"name":"path","type":"string","required":true},
-                {"name":"insert_after","type":"integer|null","required":false,"description":"Insert after this line (null = prepend)."},
-                {"name":"lines","type":"array of string","required":true,"description":"Lines to insert."},
-                {"name":"expected_version","type":"integer","required":false}
-            ],
-            "returns": "JSON {inserted_count, first_node_id, version} or \"error: …\"",
-        }),
-        serde_json::json!({
-            "name": "delete_lines",
-            "category": "editing",
-            "description": "Delete one or more consecutive line nodes from the CST.",
-            "parameters": [
-                {"name":"path","type":"string","required":true},
-                {"name":"node_id","type":"integer","required":true,"description":"First line to delete."},
-                {"name":"count","type":"integer","required":true,"description":"Number of lines to delete (>= 1)."},
-                {"name":"expected_version","type":"integer","required":false}
-            ],
-            "returns": "\"ok: …\" | \"conflict: …\" | \"error: …\"",
-        }),
-        serde_json::json!({
-            "name": "save_file",
-            "category": "editing",
-            "description": "Flush the in-memory CST for a tracked file to disk (lossless round-trip).",
-            "parameters": [
-                {"name":"path","type":"string","required":true}
-            ],
-            "returns": "\"ok: saved <path> (CST version V)\" or \"error: …\"",
-        }),
-        serde_json::json!({
-            "name": "query_tool",
-            "category": "help",
-            "description": "Return documentation and tool-selection guidance. Omit tool_name for the full catalog. Provide tool_name for focused docs.",
-            "parameters": [
-                {"name":"tool_name","type":"string","required":false,"description":"Name of the tool to look up, or omit for full catalog."}
-            ],
-            "returns": "JSON catalog or single tool entry.",
-        }),
+        serde_json::json!({"name":"track_file","category":"tracking","description":"Load file into memory as a tree-sitter CST and watch for external changes."}),
+        serde_json::json!({"name":"untrack_file","category":"tracking","description":"Remove file from memory and stop watching."}),
+        serde_json::json!({"name":"list_tracked_files","category":"tracking","description":"List all tracked files. Returns JSON {count, files}."}),
+        serde_json::json!({"name":"create_file","category":"file_management","description":"Create a new file on disk. set track=true to load immediately.","params":["path","content?","track?"]}),
+        serde_json::json!({"name":"delete_file","category":"file_management","description":"Delete a file from disk (auto-untracks).","params":["path"]}),
+        serde_json::json!({"name":"load_file","category":"inspection","description":"Quick summary: language, line count, root node, version.","params":["path"]}),
+        serde_json::json!({"name":"get_tree_skeleton","category":"inspection","description":"Hierarchical JSON of the parse tree. Omit node_id for file root. named_only=true hides punctuation.","params":["path","node_id?","max_depth?","named_only?"]}),
+        serde_json::json!({"name":"get_node","category":"inspection","description":"Metadata for one node: kind, text_preview, row/col, byte offsets, child count, version.","params":["path","node_id"]}),
+        serde_json::json!({"name":"get_children","category":"inspection","description":"Direct children of a node with field names (name, body, params…). named_only=true omits punctuation.","params":["path","node_id","named_only?"]}),
+        serde_json::json!({"name":"query_file","category":"query","description":"tree-sitter s-expression query in one file. Returns captured nodes.","params":["path","ts_query","max_matches?"],"example":"(function_item name: (identifier) @fn_name)"}),
+        serde_json::json!({"name":"query_workspace","category":"query","description":"Same tree-sitter query across all tracked files.","params":["ts_query","max_matches?"]}),
+        serde_json::json!({"name":"edit_node","category":"editing","description":"Replace a node's entire source span with new_text. Re-parses file. IDs stale after this.","params":["path","node_id","new_text","expected_version?"]}),
+        serde_json::json!({"name":"insert_before","category":"editing","description":"Insert text immediately before a node.","params":["path","node_id","text","expected_version?"]}),
+        serde_json::json!({"name":"insert_after","category":"editing","description":"Insert text immediately after a node.","params":["path","node_id","text","expected_version?"]}),
+        serde_json::json!({"name":"insert_into","category":"editing","description":"Insert text inside a node at its start or end (position='start'|'end', default 'end'). Good for adding statements to a block body.","params":["path","node_id","text","position?","expected_version?"]}),
+        serde_json::json!({"name":"delete_node","category":"editing","description":"Delete a node's entire source span.","params":["path","node_id","expected_version?"]}),
+        serde_json::json!({"name":"save_file","category":"editing","description":"Flush in-memory CST to disk.","params":["path"]}),
+        serde_json::json!({"name":"query_tool","category":"help","description":"Get docs for any tool or the full catalog with selection guide.","params":["tool_name?"]}),
     ]
 }

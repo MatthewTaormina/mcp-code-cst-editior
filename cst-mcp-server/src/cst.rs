@@ -1,1585 +1,804 @@
-use std::path::{Path, PathBuf};
-
-use rowan::{GreenNode, GreenNodeBuilder, GreenToken, Language, NodeOrToken, SyntaxNode};
-use serde::{Deserialize, Serialize};
-
-use crate::lexer::{self, TokenKind};
-
-// ---------------------------------------------------------------------------
-// SyntaxKind — the discriminant enum for every node/token in our generic CST.
-// ---------------------------------------------------------------------------
-
-/// Every node and token in the CST has one of these kinds.
-///
-/// Variants 0–3 are structural (Root, Line, plain Text, Error).
-/// Variants 4–10 are token-level kinds emitted by language-specific lexers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(u16)]
-pub enum SyntaxKind {
-    /// The root node — wraps the entire file.
-    Root = 0,
-    /// One logical line of text (including its trailing `\n`, if any).
-    Line = 1,
-    /// Raw text token used by the plain-text (non-language-aware) grammar.
-    Text = 2,
-    /// Catch-all for anything not otherwise classified.
-    Error = 3,
-
-    // -----------------------------------------------------------------------
-    // Token-level kinds (emitted by language-specific lexers)
-    // -----------------------------------------------------------------------
-    /// A reserved keyword (`fn`, `let`, `pub`, …).
-    Keyword = 4,
-    /// An identifier.
-    Identifier = 5,
-    /// A string, char, byte-string, raw-string, or numeric literal.
-    Literal = 6,
-    /// A line comment or block comment.
-    Comment = 7,
-    /// Horizontal whitespace (spaces / tabs, not newlines).
-    Whitespace = 8,
-    /// Punctuation, operators, or any other single character.
-    Punctuation = 9,
-    /// A single newline character (`\n`).
-    Newline = 10,
-}
-
-impl SyntaxKind {
-    /// Return a human-readable name for this kind.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            SyntaxKind::Root => "Root",
-            SyntaxKind::Line => "Line",
-            SyntaxKind::Text => "Text",
-            SyntaxKind::Error => "Error",
-            SyntaxKind::Keyword => "Keyword",
-            SyntaxKind::Identifier => "Identifier",
-            SyntaxKind::Literal => "Literal",
-            SyntaxKind::Comment => "Comment",
-            SyntaxKind::Whitespace => "Whitespace",
-            SyntaxKind::Punctuation => "Punctuation",
-            SyntaxKind::Newline => "Newline",
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// rowan Language glue
-// ---------------------------------------------------------------------------
-
-/// Marker type that binds our `SyntaxKind` to rowan's generic machinery.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Lang {}
-
-impl Language for Lang {
-    type Kind = SyntaxKind;
-
-    fn kind_from_raw(raw: rowan::SyntaxKind) -> SyntaxKind {
-        match raw.0 {
-            0 => SyntaxKind::Root,
-            1 => SyntaxKind::Line,
-            2 => SyntaxKind::Text,
-            4 => SyntaxKind::Keyword,
-            5 => SyntaxKind::Identifier,
-            6 => SyntaxKind::Literal,
-            7 => SyntaxKind::Comment,
-            8 => SyntaxKind::Whitespace,
-            9 => SyntaxKind::Punctuation,
-            10 => SyntaxKind::Newline,
-            _ => SyntaxKind::Error,
-        }
-    }
-
-    fn kind_to_raw(kind: SyntaxKind) -> rowan::SyntaxKind {
-        rowan::SyntaxKind(kind as u16)
-    }
-}
-
-pub type LangSyntaxNode = SyntaxNode<Lang>;
-
+﻿use std::path::{Path, PathBuf};
+use serde::Serialize;
+use tree_sitter::StreamingIterator as _;
 // ---------------------------------------------------------------------------
 // NodeId
 // ---------------------------------------------------------------------------
-
-/// Stable identifier for a CST node.
+/// A tree-sitter node identity within a single parse tree.
 ///
-/// For the line-oriented CST, the `NodeId` is the 0-based line index within
-/// the file, which is stable across edits to *other* lines.
-pub type NodeId = u32;
-
+/// Equal to `tree_sitter::Node::id() as u64`.  Node IDs are unique within one
+/// parse tree but are **not** stable across re-parses (any edit increments the
+/// file version and all IDs become stale).  Always re-query after an edit.
+pub type NodeId = u64;
 // ---------------------------------------------------------------------------
-// FileLanguage — selects the lexer for a file
+// FileLanguage
 // ---------------------------------------------------------------------------
-
-/// The grammar/lexer to use when building the CST for a file.
+/// The grammar to use when parsing a source file with tree-sitter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileLanguage {
-    /// Rust source code: sub-line token-level grammar.
     Rust,
-    /// Everything else: plain line-oriented grammar (one `Text` token per line).
+    JavaScript,
+    /// TypeScript (`.ts`).
+    TypeScript,
+    /// TSX — TypeScript with JSX (`.tsx`).
+    Tsx,
+    Css,
+    Html,
+    /// No recognised grammar — file is stored verbatim without a parse tree.
     Plain,
 }
-
 impl FileLanguage {
-    /// Infer the file language from a file path extension.
+    /// Infer the language from a file path extension.
     pub fn from_path(path: &Path) -> Self {
         match path.extension().and_then(|e| e.to_str()) {
             Some("rs") => FileLanguage::Rust,
+            Some("js") | Some("jsx") | Some("mjs") | Some("cjs") => FileLanguage::JavaScript,
+            Some("ts") => FileLanguage::TypeScript,
+            Some("tsx") => FileLanguage::Tsx,
+            Some("css") | Some("scss") | Some("sass") | Some("less") => FileLanguage::Css,
+            Some("html") | Some("htm") | Some("svg") => FileLanguage::Html,
             _ => FileLanguage::Plain,
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// NodeInfo — rich metadata for a single Line node
-// ---------------------------------------------------------------------------
-
-/// Serialisable metadata describing a single Line node in the CST.
-#[derive(Debug, Clone, Serialize)]
-pub struct NodeInfo {
-    /// 0-based index of this Line node within the file.
-    pub node_id: NodeId,
-    /// Human-readable kind label (always `"Line"` for the current grammar).
-    pub kind: &'static str,
-    /// Full text content of the line (including any trailing `\n`).
-    pub text: String,
-    /// Byte offset of the first character of this node within the file.
-    pub span_start: u32,
-    /// Byte offset one past the last character of this node.
-    pub span_end: u32,
-}
-
-impl NodeInfo {
-    /// A shortened preview of the node's text, suitable for skeleton listings.
-    ///
-    /// Strips the trailing newline and truncates to 80 characters.
-    pub fn text_preview(&self) -> String {
-        let raw = self.text.trim_end_matches('\n');
-        if raw.len() > 80 {
-            format!("{}…", &raw[..80])
-        } else {
-            raw.to_owned()
+    /// Return the tree-sitter `Language` for this variant, or `None` for
+    /// `Plain` (no grammar).
+    pub fn ts_language(self) -> Option<tree_sitter::Language> {
+        match self {
+            FileLanguage::Rust => Some(tree_sitter_rust::LANGUAGE.into()),
+            FileLanguage::JavaScript => Some(tree_sitter_javascript::LANGUAGE.into()),
+            FileLanguage::TypeScript => {
+                Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+            }
+            FileLanguage::Tsx => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
+            FileLanguage::Css => Some(tree_sitter_css::LANGUAGE.into()),
+            FileLanguage::Html => Some(tree_sitter_html::LANGUAGE.into()),
+            FileLanguage::Plain => None,
         }
     }
 }
-
 // ---------------------------------------------------------------------------
-// TokenInfo — metadata for a single token within a Line node
+// NodeInfo
 // ---------------------------------------------------------------------------
-
-/// Serialisable metadata describing a single token inside a Line node.
+/// Rich metadata for a single CST node.
 #[derive(Debug, Clone, Serialize)]
-pub struct TokenInfo {
-    /// 0-based index of this token among its Line node's children.
-    pub token_idx: u32,
-    /// Human-readable kind label (e.g. `"Keyword"`, `"Identifier"`, …).
-    pub kind: &'static str,
-    /// The exact text of this token (lossless).
-    pub text: String,
-    /// Byte offset of the first character within the file.
-    pub span_start: u32,
-    /// Byte offset one past the last character.
-    pub span_end: u32,
+pub struct NodeInfo {
+    /// Unique ID within the current parse tree.
+    pub node_id: NodeId,
+    /// tree-sitter node kind (e.g. `"function_definition"`, `"identifier"`).
+    pub kind: String,
+    /// First ~80 chars of the node's source text (truncated at first newline).
+    pub text_preview: String,
+    pub start_row: u32,
+    pub start_col: u32,
+    pub end_row: u32,
+    pub end_col: u32,
+    pub start_byte: u32,
+    pub end_byte: u32,
+    pub is_named: bool,
+    /// `true` if this subtree contains a parse error.
+    pub has_error: bool,
+    /// Number of named (non-anonymous) children.
+    pub named_child_count: u32,
 }
-
+// ---------------------------------------------------------------------------
+// ChildInfo
+// ---------------------------------------------------------------------------
+/// Summary of one direct child of a CST node.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChildInfo {
+    pub node_id: NodeId,
+    pub kind: String,
+    /// Field name if the child is a named field of its parent (e.g. `"name"`,
+    /// `"body"`, `"parameters"`), or `None` for anonymous structural children.
+    pub field_name: Option<String>,
+    pub text_preview: String,
+    pub start_row: u32,
+    pub start_col: u32,
+    pub named_child_count: u32,
+    pub has_error: bool,
+}
+// ---------------------------------------------------------------------------
+// QueryMatchResult
+// ---------------------------------------------------------------------------
+/// One result entry from a tree-sitter s-expression query.
+#[derive(Debug, Clone, Serialize)]
+pub struct QueryMatchResult {
+    /// The `@capture_name` that matched.
+    pub capture_name: String,
+    pub node_id: NodeId,
+    pub kind: String,
+    pub text_preview: String,
+    pub start_row: u32,
+    pub start_col: u32,
+    pub end_row: u32,
+    pub end_col: u32,
+}
 // ---------------------------------------------------------------------------
 // CstFile
 // ---------------------------------------------------------------------------
-
 /// An in-memory representation of a parsed source file.
 pub struct CstFile {
     pub path: PathBuf,
-    /// The rowan green tree root — immutable, shared, and cheaply cloneable.
-    pub root: GreenNode,
+    /// Owned UTF-8 source text — the single source of truth for file content.
+    source: String,
+    /// Parsed tree-sitter CST, or `None` for plain-text files.
+    tree: Option<tree_sitter::Tree>,
     /// Monotonically increasing version counter.  Incremented on every reload
-    /// or successful mutation.
+    /// or successful mutation.  Node IDs are stale after any version change.
     pub version: u64,
-    /// Which lexer was used to build `root`.
     language: FileLanguage,
 }
-
 impl CstFile {
-    /// Parse `content` into a CST using the lexer appropriate for `path`'s
-    /// file extension.  `.rs` files get a token-level Rust grammar; all
-    /// others get the plain line-oriented grammar.
+    // -----------------------------------------------------------------------
+    // Construction
+    // -----------------------------------------------------------------------
+    /// Parse `content` into a CST using the grammar appropriate for `path`'s
+    /// file extension.  Plain-text files are stored without a parse tree.
     pub fn parse(path: PathBuf, content: &str) -> Self {
-        let language = FileLanguage::from_path(&path);
-        let root = build_tree(content, language);
-        Self {
-            path,
-            root,
-            version: 0,
-            language,
-        }
+        Self::parse_with_version(path, content, 0)
     }
-
-    /// The language/lexer used for this file.
+    fn parse_with_version(path: PathBuf, content: &str, version: u64) -> Self {
+        let language = FileLanguage::from_path(&path);
+        let source = content.to_string();
+        let tree = Self::do_parse(language, &source);
+        Self { path, source, tree, version, language }
+    }
+    fn do_parse(language: FileLanguage, source: &str) -> Option<tree_sitter::Tree> {
+        let lang = language.ts_language()?;
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&lang).ok()?;
+        parser.parse(source, None)
+    }
+    // -----------------------------------------------------------------------
+    // Accessors
+    // -----------------------------------------------------------------------
+    /// The grammar used for this file.
     pub fn language(&self) -> FileLanguage {
         self.language
     }
-
-    /// Reconstruct the file's text from the CST (lossless round-trip).
-    pub fn to_text(&self) -> String {
-        LangSyntaxNode::new_root(self.root.clone())
-            .text()
-            .to_string()
+    /// The file's source text (lossless — never modified by edits in place).
+    pub fn to_text(&self) -> &str {
+        &self.source
     }
-
-    /// Return rich metadata for the Line node identified by `node_id`.
+    /// The root node ID of the parse tree, if one exists.
+    pub fn root_node_id(&self) -> Option<NodeId> {
+        self.tree.as_ref().map(|t| t.root_node().id() as NodeId)
+    }
+    // -----------------------------------------------------------------------
+    // Node lookup
+    // -----------------------------------------------------------------------
+    /// Find a node in the parse tree by its ID using an iterative DFS walk.
     ///
-    /// Returns an error if `node_id` is out of range.
-    pub fn get_node(&self, node_id: NodeId) -> anyhow::Result<NodeInfo> {
-        let root = LangSyntaxNode::new_root(self.root.clone());
-        let children: Vec<_> = root.children().collect();
-
-        let idx = node_id as usize;
-        if idx >= children.len() {
-            anyhow::bail!(
-                "node_id {} is out of range (file has {} line nodes)",
-                node_id,
-                children.len()
-            );
-        }
-
-        let node = &children[idx];
-        let range = node.text_range();
-
-        Ok(NodeInfo {
-            node_id,
-            kind: "Line",
-            text: node.text().to_string(),
-            span_start: u32::from(range.start()),
-            span_end: u32::from(range.end()),
-        })
-    }
-
-    /// Return metadata for every Line node in the file, in document order.
-    pub fn tree_skeleton(&self) -> Vec<NodeInfo> {
-        let root = LangSyntaxNode::new_root(self.root.clone());
-        root.children()
-            .enumerate()
-            .map(|(i, node)| {
-                let range = node.text_range();
-                NodeInfo {
-                    node_id: i as NodeId,
-                    kind: "Line",
-                    text: node.text().to_string(),
-                    span_start: u32::from(range.start()),
-                    span_end: u32::from(range.end()),
+    /// Returns `None` if the tree is absent (plain text) or if the ID does
+    /// not match any current node (stale reference after a version change).
+    pub fn find_node(&self, target_id: NodeId) -> Option<tree_sitter::Node<'_>> {
+        let tree = self.tree.as_ref()?;
+        let target = target_id as usize;
+        let mut cursor = tree.walk();
+        let mut depth = 0i32;
+        loop {
+            let node = cursor.node();
+            if node.id() == target {
+                return Some(node);
+            }
+            if cursor.goto_first_child() {
+                depth += 1;
+                continue;
+            }
+            loop {
+                if cursor.goto_next_sibling() {
+                    break;
                 }
-            })
-            .collect()
-    }
-
-    /// Return all token-level children of the Line node identified by
-    /// `node_id`.
-    ///
-    /// For `.rs` files each token carries a semantic kind (Keyword,
-    /// Identifier, Literal, …).  For plain-text files the single token is
-    /// classified as `Text`.  Returns an error if `node_id` is out of range.
-    pub fn get_line_tokens(&self, node_id: NodeId) -> anyhow::Result<Vec<TokenInfo>> {
-        let root = LangSyntaxNode::new_root(self.root.clone());
-        let children: Vec<_> = root.children().collect();
-
-        let idx = node_id as usize;
-        if idx >= children.len() {
-            anyhow::bail!(
-                "node_id {} is out of range (file has {} line nodes)",
-                node_id,
-                children.len()
-            );
-        }
-
-        let line_node = &children[idx];
-        let mut token_infos = Vec::new();
-        let mut token_idx: u32 = 0;
-
-        for elem in line_node.children_with_tokens() {
-            if let NodeOrToken::Token(tok) = elem {
-                let range = tok.text_range();
-                let kind = tok.kind();
-                token_infos.push(TokenInfo {
-                    token_idx,
-                    kind: kind.as_str(),
-                    text: tok.text().to_owned(),
-                    span_start: u32::from(range.start()),
-                    span_end: u32::from(range.end()),
-                });
-                token_idx += 1;
+                if depth == 0 {
+                    return None;
+                }
+                cursor.goto_parent();
+                depth -= 1;
             }
         }
-
-        Ok(token_infos)
     }
-
-    /// Replace the content of the line identified by `node_id` (0-based line
-    /// index) with `new_text`, preserving all other lines verbatim.
-    ///
-    /// Uses rowan's native `replace_child` to surgically swap only the
-    /// affected Line green node in the tree, leaving all sibling nodes shared
-    /// (O(1) clone via `Arc`).  Returns a new `CstFile` with an incremented
-    /// version on success.
-    pub fn replace_node(&self, node_id: NodeId, new_text: &str) -> anyhow::Result<CstFile> {
-        let idx = node_id as usize;
-        let existing_count = self.root.children().count();
-
-        if idx >= existing_count {
-            anyhow::bail!(
-                "node_id {} is out of range (file has {} line nodes)",
-                node_id,
-                existing_count
-            );
-        }
-
-        // Preserve the trailing newline of the original line so that the
-        // lines below it are not shifted.
-        let original_text = self.get_node(node_id)?.text;
-        let effective: std::borrow::Cow<'_, str> =
-            if original_text.ends_with('\n') && !new_text.ends_with('\n') {
-                std::borrow::Cow::Owned(format!("{new_text}\n"))
-            } else {
-                std::borrow::Cow::Borrowed(new_text)
-            };
-
-        // Build only the replacement Line node — all other nodes are shared.
-        let new_line = build_line_node(&effective, self.language);
-        let new_root = self
-            .root
-            .replace_child(idx, NodeOrToken::Node(new_line));
-
-        Ok(CstFile {
-            path: self.path.clone(),
-            root: new_root,
-            version: self.version + 1,
-            language: self.language,
-        })
+    /// Return rich metadata for the node identified by `node_id`.
+    pub fn get_node(&self, node_id: NodeId) -> anyhow::Result<NodeInfo> {
+        let tree = self.tree.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("plain-text files do not have a parse tree"))?;
+        let node = if (tree.root_node().id() as NodeId) == node_id {
+            tree.root_node()
+        } else {
+            self.find_node(node_id)
+                .ok_or_else(|| anyhow::anyhow!(
+                    "node_id {} not found — the file may have been edited since you last read it \
+                     (version {})",
+                    node_id, self.version
+                ))?
+        };
+        Ok(self.node_to_info(node))
     }
-
-    /// Insert one or more new lines into the file's CST.
+    // -----------------------------------------------------------------------
+    // Tree skeleton
+    // -----------------------------------------------------------------------
+    /// Return a hierarchical JSON representation of the parse tree.
     ///
-    /// `insert_after` is the 0-based index of the line *after which* the new
-    /// lines are inserted.  Pass `None` to prepend at the beginning of the
-    /// file.  Each string in `lines` becomes one new Line node; a trailing
-    /// `\n` is appended automatically when missing.
-    ///
-    /// Uses rowan's `splice_children` to perform the insertion without
-    /// re-parsing unchanged lines.  Returns a new `CstFile` with an
-    /// incremented version on success.
-    pub fn insert_lines(
+    /// * `root_id` — start from this node (default: file root).
+    /// * `max_depth` — maximum recursion depth (default: 3).
+    /// * `named_only` — when `true`, omit anonymous punctuation/keyword nodes.
+    pub fn get_tree_skeleton(
         &self,
-        insert_after: Option<NodeId>,
-        lines: &[String],
-    ) -> anyhow::Result<CstFile> {
-        if lines.is_empty() {
-            anyhow::bail!("lines must not be empty");
-        }
-
-        let existing_count = self.root.children().count();
-
-        let insert_idx = match insert_after {
-            None => 0,
+        root_id: Option<NodeId>,
+        max_depth: Option<u32>,
+        named_only: bool,
+    ) -> anyhow::Result<serde_json::Value> {
+        let tree = self.tree.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("plain-text files do not have a parse tree"))?;
+        let root_node = match root_id {
+            None => tree.root_node(),
             Some(id) => {
-                let idx = id as usize;
-                if idx >= existing_count {
-                    anyhow::bail!(
-                        "insert_after {} is out of range (file has {} line nodes)",
-                        id,
-                        existing_count
-                    );
+                if (tree.root_node().id() as NodeId) == id {
+                    tree.root_node()
+                } else {
+                    self.find_node(id).ok_or_else(|| {
+                        anyhow::anyhow!("node_id {} not found (version {})", id, self.version)
+                    })?
                 }
-                idx + 1
             }
         };
-
-        let new_nodes: Vec<NodeOrToken<GreenNode, GreenToken>> = lines
-            .iter()
-            .map(|text| {
-                let effective: std::borrow::Cow<'_, str> = if text.ends_with('\n') {
-                    std::borrow::Cow::Borrowed(text.as_str())
-                } else {
-                    std::borrow::Cow::Owned(format!("{text}\n"))
-                };
-                NodeOrToken::Node(build_line_node(&effective, self.language))
-            })
-            .collect();
-
-        let new_root = self
-            .root
-            .splice_children(insert_idx..insert_idx, new_nodes);
-
-        Ok(CstFile {
-            path: self.path.clone(),
-            root: new_root,
-            version: self.version + 1,
-            language: self.language,
-        })
+        let max_d = max_depth.unwrap_or(3);
+        Ok(self.node_to_skeleton(root_node, 0, max_d, named_only))
     }
-
-    /// Delete `count` consecutive Line nodes starting at `node_id`.
-    ///
-    /// Uses rowan's `splice_children` to perform the deletion without
-    /// re-parsing unchanged lines.  Returns a new `CstFile` with an
-    /// incremented version on success.
-    pub fn delete_lines(&self, node_id: NodeId, count: u32) -> anyhow::Result<CstFile> {
-        if count == 0 {
-            anyhow::bail!("count must be at least 1");
+    fn node_to_skeleton(
+        &self,
+        node: tree_sitter::Node<'_>,
+        depth: u32,
+        max_depth: u32,
+        named_only: bool,
+    ) -> serde_json::Value {
+        let text = &self.source[node.start_byte()..node.end_byte()];
+        let start = node.start_position();
+        let mut obj = serde_json::json!({
+            "node_id": node.id() as NodeId,
+            "kind": node.kind(),
+            "named": node.is_named(),
+            "text_preview": make_preview(text),
+            "row": start.row,
+            "col": start.column,
+            "named_child_count": node.named_child_count(),
+        });
+        if node.has_error() {
+            obj["has_error"] = serde_json::Value::Bool(true);
         }
-
-        let existing_count = self.root.children().count();
-        let idx = node_id as usize;
-        let end = idx + count as usize;
-
-        if idx >= existing_count {
-            anyhow::bail!(
-                "node_id {} is out of range (file has {} line nodes)",
-                node_id,
-                existing_count
-            );
+        if depth < max_depth && node.child_count() > 0 {
+            // Collect children first, then recurse (avoids borrow overlap).
+            let child_nodes: Vec<tree_sitter::Node<'_>> = {
+                let mut cur = node.walk();
+                node.children(&mut cur)
+                    .filter(|c| !named_only || c.is_named())
+                    .collect()
+            };
+            if !child_nodes.is_empty() {
+                let children: Vec<serde_json::Value> = child_nodes
+                    .into_iter()
+                    .map(|c| self.node_to_skeleton(c, depth + 1, max_depth, named_only))
+                    .collect();
+                obj["children"] = serde_json::Value::Array(children);
+            }
         }
-        if end > existing_count {
-            anyhow::bail!(
-                "delete range {}..{} exceeds file length ({} line nodes)",
-                idx,
-                end,
-                existing_count
-            );
-        }
-
-        let new_root = self.root.splice_children(
-            idx..end,
-            std::iter::empty::<NodeOrToken<GreenNode, GreenToken>>(),
-        );
-
-        Ok(CstFile {
-            path: self.path.clone(),
-            root: new_root,
-            version: self.version + 1,
-            language: self.language,
-        })
+        obj
     }
-}
-
-// ---------------------------------------------------------------------------
-// Query — structured search across the CST
-// ---------------------------------------------------------------------------
-
-/// A structured query expression that filters Line nodes or individual tokens.
-///
-/// All filter fields are optional.  An expression with no fields matches
-/// everything at the selected depth.  Multiple fields are AND-ed together.
-///
-/// ## Quick examples
-///
-/// All function definitions at the top level of a Rust file:
-/// `{"semantic":"fn_def","scope_depth_max":0}`
-///
-/// All uses of a specific identifier anywhere in the file:
-/// `{"identifier_name":"my_var"}`
-///
-/// Lines containing a TODO comment:
-/// `{"text_contains":"TODO"}`
-///
-/// All keyword tokens on lines 0–20:
-/// `{"depth":"token","kind":"Keyword","node_id_to":20}`
-#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
-pub struct QueryExpr {
-    // ── text / kind filters ──────────────────────────────────────────────────
-
-    /// Filter by kind name (case-insensitive).
-    ///
-    /// At `depth="line"` the only valid value is `"Line"`.
-    /// At `depth="token"` valid values for Rust files are: `"Keyword"`,
-    /// `"Identifier"`, `"Literal"`, `"Comment"`, `"Whitespace"`,
-    /// `"Punctuation"`, `"Newline"`.  For plain files: `"Text"`.
-    pub kind: Option<String>,
-
-    /// Require the line/token text to contain this substring (case-sensitive).
-    pub text_contains: Option<String>,
-
-    /// Require the line/token text to match this glob pattern.
-    ///
-    /// `*` matches any sequence of characters (including none).
-    /// `?` matches exactly one character.
-    /// Neither metacharacter restricts path separators — this is text matching.
-    pub text_glob: Option<String>,
-
-    // ── line-range filter ────────────────────────────────────────────────────
-
-    /// Only consider lines whose 0-based `node_id` is ≥ this value.
-    pub node_id_from: Option<u32>,
-
-    /// Only consider lines whose 0-based `node_id` is ≤ this value (inclusive).
-    pub node_id_to: Option<u32>,
-
-    // ── depth ────────────────────────────────────────────────────────────────
-
-    /// The level at which to match: `"line"` (default) or `"token"`.
-    ///
-    /// `"line"` — each Line node is tested as a whole; results include the
-    /// full line text.
-    ///
-    /// `"token"` — each token inside every Line node is tested individually;
-    /// results include the token text and `token_idx`.
-    ///
-    /// Overridden to token-depth when `identifier_name` is set; overridden to
-    /// line-depth (with capture) when `semantic` is set.
-    pub depth: Option<String>,
-
-    // ── code-native (semantic) patterns ─────────────────────────────────────
-
-    /// Match lines that contain a specific syntactic construct (Rust files only).
-    ///
-    /// | Value | What it matches | `capture` field |
-    /// |---|---|---|
-    /// | `"fn_def"` | `fn <name>(…)` | function name |
-    /// | `"struct_def"` | `struct <name>` | struct name |
-    /// | `"enum_def"` | `enum <name>` | enum name |
-    /// | `"trait_def"` | `trait <name>` | trait name |
-    /// | `"impl_block"` | `impl [Trait for] Type` | first identifier after `impl` |
-    /// | `"type_def"` | `type <name> =` | alias name |
-    /// | `"variable_def"` | `let [mut] <name>` / `const <name>` / `static [mut] <name>` | variable name |
-    /// | `"use_stmt"` | `use <path>;` | the imported path |
-    /// | `"macro_call"` | `<name>!(…)` | macro name |
-    ///
-    /// This field implies line-depth output even when `depth="token"` is set.
-    /// Each matching line produces one result with a non-null `capture`.
-    /// Can be combined with `scope_depth_min`/`scope_depth_max` to restrict
-    /// to a particular nesting level (e.g. only top-level `fn` definitions).
-    pub semantic: Option<String>,
-
-    /// Find every occurrence of a specific identifier by exact name.
-    ///
-    /// Operates at token depth — each matching `Identifier` token becomes its
-    /// own result entry with a `token_idx`.  Can be combined with
-    /// `scope_depth_min`/`scope_depth_max` or `node_id_from`/`node_id_to` to
-    /// narrow the search to a particular scope or region of the file.
-    pub identifier_name: Option<String>,
-
-    // ── scope-depth filters ──────────────────────────────────────────────────
-
-    /// Only include results where the brace-nesting depth at the line's start
-    /// is ≥ this value.  Depth 0 = top-level code, 1 = inside one `{…}`
-    /// block, and so on.
-    ///
-    /// Depth is computed by counting `{` and `}` `Punctuation` tokens as we
-    /// scan the file.  Because punctuation tokens are never generated inside
-    /// string literals or comments (those are whole `Literal`/`Comment`
-    /// tokens), depth is accurate for typical Rust code.  Multi-line string
-    /// literals spanning more than one source line are a known limitation.
-    pub scope_depth_min: Option<u32>,
-
-    /// Only include results where the brace-nesting depth at the line's start
-    /// is ≤ this value.
-    pub scope_depth_max: Option<u32>,
-}
-
-/// A single item returned by [`CstFile::query`].
-#[derive(Debug, Clone, Serialize)]
-pub struct QueryMatch {
-    /// 0-based index of the Line node that produced this match.
-    pub node_id: u32,
-    /// Kind label: `"Line"` for line-depth matches, or a token kind name
-    /// (`"Keyword"`, `"Identifier"`, …) for token-depth matches.
-    pub kind: String,
-    /// Full text of the matched line or token (including any trailing `\n`).
-    pub text: String,
-    /// Byte offset of the first character within the file.
-    pub span_start: u32,
-    /// Byte offset one past the last character of this match.
-    pub span_end: u32,
-    /// For token-depth matches: 0-based index of the token within its Line.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub token_idx: Option<u32>,
-    /// For semantic pattern matches: the primary name extracted from the
-    /// matched construct (function name, variable name, import path, etc.).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub capture: Option<String>,
-    /// Heuristic brace-nesting depth at the start of this line.
-    /// 0 = top-level code, 1 = inside one `{…}` block, etc.
-    pub scope_depth: u32,
-}
-
-// ---------------------------------------------------------------------------
-// CstFile::query — extension impl
-// ---------------------------------------------------------------------------
-
-impl CstFile {
-    /// Run `expr` against this file's CST and return all matching items in
-    /// document order.
-    ///
-    /// See [`QueryExpr`] for the full description of each filter field.
-    /// Filters are applied in the following order:
-    ///
-    /// 1. `node_id_from` / `node_id_to` — skip lines outside the range.
-    /// 2. `scope_depth_min` / `scope_depth_max` — skip lines at the wrong
-    ///    brace-nesting depth.
-    /// 3. `semantic` (line-depth, returns capture) *or* `identifier_name`
-    ///    (token-depth, exact identifier) *or* generic `kind`/`text_*`/`depth`
-    ///    filters.
-    pub fn query(&self, expr: &QueryExpr) -> Vec<QueryMatch> {
-        let root = LangSyntaxNode::new_root(self.root.clone());
-        let mut results = Vec::new();
-        let mut depth: u32 = 0; // heuristic brace-nesting depth
-
-        let is_semantic = expr.semantic.is_some();
-        let is_ident = expr.identifier_name.is_some();
-        // token_level is true for generic token searches and for identifier_name;
-        // overridden by is_semantic (always line-level).
-        let token_level = !is_semantic
-            && (is_ident || expr.depth.as_deref() == Some("token"));
-
-        for (line_idx, line_node) in root.children().enumerate() {
-            let node_id = line_idx as u32;
-
-            // Collect (kind, text, span_start, span_end) for all tokens in
-            // this line.  Needed for semantic matching, scope updates, and
-            // token-level filtering.
-            let raw_tokens: Vec<(String, String, u32, u32)> = line_node
-                .children_with_tokens()
-                .filter_map(|elem| {
-                    if let NodeOrToken::Token(tok) = elem {
-                        let r = tok.text_range();
-                        Some((
-                            tok.kind().as_str().to_owned(),
-                            tok.text().to_owned(),
-                            u32::from(r.start()),
-                            u32::from(r.end()),
-                        ))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            // Record the depth at the START of this line, then advance depth
-            // by counting net `{`/`}` in the line's tokens.
-            let line_depth = depth;
-            for (kind, text, _, _) in &raw_tokens {
-                if kind == "Punctuation" {
-                    match text.as_str() {
-                        "{" => depth += 1,
-                        "}" => depth = depth.saturating_sub(1),
-                        _ => {}
-                    }
+    // -----------------------------------------------------------------------
+    // Children
+    // -----------------------------------------------------------------------
+    /// Return the direct children of a node, with optional filtering to named
+    /// nodes only and field-name annotation.
+    pub fn get_children(
+        &self,
+        node_id: NodeId,
+        named_only: bool,
+    ) -> anyhow::Result<Vec<ChildInfo>> {
+        let tree = self.tree.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("plain-text files do not have a parse tree"))?;
+        let node = if (tree.root_node().id() as NodeId) == node_id {
+            tree.root_node()
+        } else {
+            self.find_node(node_id)
+                .ok_or_else(|| anyhow::anyhow!("node_id {} not found", node_id))?
+        };
+        let mut children = Vec::new();
+        let mut cursor = node.walk();
+        if cursor.goto_first_child() {
+            loop {
+                let child = cursor.node();
+                if !named_only || child.is_named() {
+                    let field_name = cursor.field_name().map(|s| s.to_string());
+                    let text = &self.source[child.start_byte()..child.end_byte()];
+                    let start = child.start_position();
+                    children.push(ChildInfo {
+                        node_id: child.id() as NodeId,
+                        kind: child.kind().to_string(),
+                        field_name,
+                        text_preview: make_preview(text),
+                        start_row: start.row as u32,
+                        start_col: start.column as u32,
+                        named_child_count: child.named_child_count() as u32,
+                        has_error: child.has_error(),
+                    });
                 }
-            }
-
-            // ── node_id range ───────────────────────────────────────────────
-            if let Some(from) = expr.node_id_from {
-                if node_id < from {
-                    continue;
-                }
-            }
-            if let Some(to) = expr.node_id_to {
-                if node_id > to {
+                if !cursor.goto_next_sibling() {
                     break;
                 }
             }
-
-            // ── scope-depth filter ──────────────────────────────────────────
-            if let Some(min) = expr.scope_depth_min {
-                if line_depth < min {
-                    continue;
-                }
-            }
-            if let Some(max) = expr.scope_depth_max {
-                if line_depth > max {
-                    continue;
-                }
-            }
-
-            // ── semantic pattern search (line-depth, produces capture) ───────
-            if is_semantic {
-                let pattern = expr.semantic.as_deref().unwrap();
-                if let Some(capture) =
-                    detect_semantic_pattern(&raw_tokens, pattern)
-                {
-                    let line_text = line_node.text().to_string();
-                    if basic_text_kind_matches(expr, "Line", &line_text) {
-                        let lr = line_node.text_range();
-                        results.push(QueryMatch {
-                            node_id,
-                            kind: "Line".to_owned(),
-                            text: line_text,
-                            span_start: u32::from(lr.start()),
-                            span_end: u32::from(lr.end()),
-                            token_idx: None,
-                            capture: Some(capture),
-                            scope_depth: line_depth,
-                        });
-                    }
-                }
-                continue; // semantic is always line-level — skip other paths
-            }
-
-            // ── identifier name search (token-depth) ─────────────────────────
-            if is_ident {
-                let target = expr.identifier_name.as_deref().unwrap();
-                for (tidx, (kind, text, start, end)) in
-                    raw_tokens.iter().enumerate()
-                {
-                    if kind == "Identifier" && text == target {
-                        if basic_text_kind_matches(expr, kind, text) {
-                            results.push(QueryMatch {
-                                node_id,
-                                kind: kind.clone(),
-                                text: text.clone(),
-                                span_start: *start,
-                                span_end: *end,
-                                token_idx: Some(tidx as u32),
-                                capture: None,
-                                scope_depth: line_depth,
-                            });
-                        }
-                    }
-                }
-                continue; // identifier search is always token-level
-            }
-
-            // ── generic token-depth search ───────────────────────────────────
-            if token_level {
-                for (tidx, (kind, text, start, end)) in
-                    raw_tokens.iter().enumerate()
-                {
-                    if basic_text_kind_matches(expr, kind, text) {
-                        results.push(QueryMatch {
-                            node_id,
-                            kind: kind.clone(),
-                            text: text.clone(),
-                            span_start: *start,
-                            span_end: *end,
-                            token_idx: Some(tidx as u32),
-                            capture: None,
-                            scope_depth: line_depth,
-                        });
-                    }
-                }
-            } else {
-                // ── generic line-depth search ────────────────────────────────
-                let line_text = line_node.text().to_string();
-                if basic_text_kind_matches(expr, "Line", &line_text) {
-                    let lr = line_node.text_range();
-                    results.push(QueryMatch {
-                        node_id,
-                        kind: "Line".to_owned(),
-                        text: line_text,
-                        span_start: u32::from(lr.start()),
-                        span_end: u32::from(lr.end()),
-                        token_idx: None,
-                        capture: None,
-                        scope_depth: line_depth,
-                    });
-                }
-            }
         }
-
-        results
+        Ok(children)
     }
-}
-
-// ---------------------------------------------------------------------------
-// Query helpers
-// ---------------------------------------------------------------------------
-
-/// Check whether `kind` and `text` satisfy the text/kind filter fields of
-/// `expr`.  Does **not** check `semantic`, `identifier_name`, `node_id_*`,
-/// or `scope_*` — those are handled directly in [`CstFile::query`].
-fn basic_text_kind_matches(expr: &QueryExpr, kind: &str, text: &str) -> bool {
-    if let Some(ref k) = expr.kind {
-        if !k.eq_ignore_ascii_case(kind) {
-            return false;
-        }
+    // -----------------------------------------------------------------------
+    // Edit operations
+    // -----------------------------------------------------------------------
+    /// Replace a node's source span with `new_text`, re-parse, and return a
+    /// new `CstFile` with an incremented version.
+    pub fn replace_node(
+        &self,
+        node_id: NodeId,
+        new_text: &str,
+        expected_version: Option<u64>,
+    ) -> anyhow::Result<CstFile> {
+        self.check_version(expected_version)?;
+        let node = self.require_node(node_id)?;
+        let new_source = splice(&self.source, node.start_byte(), node.end_byte(), new_text);
+        Ok(Self::parse_with_version(self.path.clone(), &new_source, self.version + 1))
     }
-    if let Some(ref needle) = expr.text_contains {
-        if !text.contains(needle.as_str()) {
-            return false;
-        }
+    /// Insert `text` immediately before a node (before its first byte).
+    pub fn insert_before_node(
+        &self,
+        node_id: NodeId,
+        text: &str,
+        expected_version: Option<u64>,
+    ) -> anyhow::Result<CstFile> {
+        self.check_version(expected_version)?;
+        let node = self.require_node(node_id)?;
+        let new_source = splice(&self.source, node.start_byte(), node.start_byte(), text);
+        Ok(Self::parse_with_version(self.path.clone(), &new_source, self.version + 1))
     }
-    if let Some(ref pattern) = expr.text_glob {
-        if !text_glob_matches(pattern, text) {
-            return false;
-        }
+    /// Insert `text` immediately after a node (after its last byte).
+    pub fn insert_after_node(
+        &self,
+        node_id: NodeId,
+        text: &str,
+        expected_version: Option<u64>,
+    ) -> anyhow::Result<CstFile> {
+        self.check_version(expected_version)?;
+        let node = self.require_node(node_id)?;
+        let new_source = splice(&self.source, node.end_byte(), node.end_byte(), text);
+        Ok(Self::parse_with_version(self.path.clone(), &new_source, self.version + 1))
     }
-    true
-}
-
-/// Detect a named semantic pattern in a line's raw token list and return the
-/// captured name on success, or `None` when the pattern does not match.
-///
-/// `tokens` is the raw `(kind_name, text, span_start, span_end)` vector for
-/// the whole line, including whitespace and newline tokens.
-fn detect_semantic_pattern(
-    tokens: &[(String, String, u32, u32)],
-    pattern: &str,
-) -> Option<String> {
-    // Build a compact, whitespace-free view for easier positional matching.
-    let code: Vec<(&str, &str)> = tokens
-        .iter()
-        .filter(|(k, _, _, _)| k != "Whitespace" && k != "Newline")
-        .map(|(k, t, _, _)| (k.as_str(), t.as_str()))
-        .collect();
-
-    match pattern {
-        "fn_def"     => keyword_then_ident(&code, "fn"),
-        "struct_def" => keyword_then_ident(&code, "struct"),
-        "enum_def"   => keyword_then_ident(&code, "enum"),
-        "trait_def"  => keyword_then_ident(&code, "trait"),
-        "type_def"   => keyword_then_ident(&code, "type"),
-
-        // impl [Generics for] Type  →  first Identifier after `impl`
-        "impl_block" => keyword_then_ident(&code, "impl"),
-
-        // use <path>;  →  everything between `use` and `;`
-        "use_stmt" => {
-            if code.first().map(|&(k, t)| k == "Keyword" && t == "use") != Some(true) {
-                return None;
-            }
-            let path: String = code[1..]
-                .iter()
-                .take_while(|&&(_, t)| t != ";")
-                .map(|&(_, t)| t)
-                .collect::<Vec<_>>()
-                .join("");
-            let trimmed = path.trim().to_owned();
-            if trimmed.is_empty() { None } else { Some(trimmed) }
-        }
-
-        // let [mut] <name>  /  const <name>  /  static [mut] <name>
-        "variable_def" => {
-            let &(first_k, first_t) = code.first()?;
-            if first_k != "Keyword"
-                || !matches!(first_t, "let" | "const" | "static")
-            {
-                return None;
-            }
-            let mut iter = code[1..].iter().peekable();
-            // Skip one optional `mut` keyword.
-            if iter.peek().map(|&&(k, t)| k == "Keyword" && t == "mut") == Some(true) {
-                iter.next();
-            }
-            iter.find(|&&(k, _)| k == "Identifier")
-                .map(|&(_, t)| t.to_owned())
-        }
-
-        // <name>!(…)
-        "macro_call" => {
-            for i in 0..code.len().saturating_sub(1) {
-                let (k0, t0) = code[i];
-                let (k1, t1) = code[i + 1];
-                if k0 == "Identifier" && k1 == "Punctuation" && t1 == "!" {
-                    return Some(t0.to_owned());
+    /// Insert `text` inside a node — either at its very start (`at_start =
+    /// true`) or at its very end (`at_start = false`).
+    ///
+    /// Typical usage: insert a new statement at the end of a function body.
+    pub fn insert_into_node(
+        &self,
+        node_id: NodeId,
+        text: &str,
+        at_start: bool,
+        expected_version: Option<u64>,
+    ) -> anyhow::Result<CstFile> {
+        self.check_version(expected_version)?;
+        let node = self.require_node(node_id)?;
+        let byte = if at_start { node.start_byte() } else { node.end_byte() };
+        let new_source = splice(&self.source, byte, byte, text);
+        Ok(Self::parse_with_version(self.path.clone(), &new_source, self.version + 1))
+    }
+    /// Delete a node's source span and re-parse.
+    pub fn delete_node(
+        &self,
+        node_id: NodeId,
+        expected_version: Option<u64>,
+    ) -> anyhow::Result<CstFile> {
+        self.check_version(expected_version)?;
+        let node = self.require_node(node_id)?;
+        let new_source = splice(&self.source, node.start_byte(), node.end_byte(), "");
+        Ok(Self::parse_with_version(self.path.clone(), &new_source, self.version + 1))
+    }
+    // -----------------------------------------------------------------------
+    // Tree-sitter query
+    // -----------------------------------------------------------------------
+    /// Run a tree-sitter s-expression query and return capture matches.
+    ///
+    /// Example query: `"(function_item name: (identifier) @fn_name)"`
+    pub fn query_ts(
+        &self,
+        ts_query: &str,
+        max_matches: Option<usize>,
+    ) -> anyhow::Result<Vec<QueryMatchResult>> {
+        let tree = self.tree.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("plain-text files do not support tree-sitter queries"))?;
+        let lang = self.language.ts_language()
+            .ok_or_else(|| anyhow::anyhow!("no language for query"))?;
+        let query = tree_sitter::Query::new(&lang, ts_query)?;
+        let cap_names: Vec<String> = query.capture_names().iter().map(|n| n.to_string()).collect();
+        let limit = max_matches.unwrap_or(usize::MAX);
+        let mut qcursor = tree_sitter::QueryCursor::new();
+        let mut results = Vec::new();
+        let mut matches = qcursor.matches(&query, tree.root_node(), self.source.as_bytes());
+        'outer: while let Some(m) = matches.next() {
+            for cap in m.captures {
+                if results.len() >= limit {
+                    break 'outer;
                 }
+                let node = cap.node;
+                let capture_name = cap_names
+                    .get(cap.index as usize)
+                    .cloned()
+                    .unwrap_or_default();
+                let text = &self.source[node.start_byte()..node.end_byte()];
+                let start = node.start_position();
+                let end = node.end_position();
+                results.push(QueryMatchResult {
+                    capture_name,
+                    node_id: node.id() as NodeId,
+                    kind: node.kind().to_string(),
+                    text_preview: make_preview(text),
+                    start_row: start.row as u32,
+                    start_col: start.column as u32,
+                    end_row: end.row as u32,
+                    end_col: end.column as u32,
+                });
             }
-            None
         }
-
-        _ => None,
+        Ok(results)
     }
-}
-
-/// Return the text of the first `Identifier` token that appears after the
-/// given `keyword` in a whitespace-stripped token list.
-fn keyword_then_ident(code: &[(&str, &str)], keyword: &str) -> Option<String> {
-    let pos = code
-        .iter()
-        .position(|&(k, t)| k == "Keyword" && t == keyword)?;
-    code[pos + 1..]
-        .iter()
-        .find(|&&(k, _)| k == "Identifier")
-        .map(|&(_, t)| t.to_owned())
-}
-
-/// Glob matching for arbitrary text (no path-separator semantics).
-///
-/// - `*` matches any sequence of characters (including empty).
-/// - `?` matches exactly one character.
-fn text_glob_matches(pattern: &str, text: &str) -> bool {
-    text_glob_inner(pattern.as_bytes(), text.as_bytes())
-}
-
-fn text_glob_inner(pat: &[u8], txt: &[u8]) -> bool {
-    match pat.split_first() {
-        None => txt.is_empty(),
-        Some((&b'*', rest)) => {
-            // Collapse consecutive `*`s for efficiency.
-            let mut rest = rest;
-            while rest.first() == Some(&b'*') {
-                rest = &rest[1..];
+    // -----------------------------------------------------------------------
+    // Error detection
+    // -----------------------------------------------------------------------
+    /// Collect all ERROR and MISSING nodes from the parse tree.
+    pub fn get_errors(&self) -> Vec<serde_json::Value> {
+        let Some(tree) = &self.tree else { return Vec::new() };
+        let mut errors = Vec::new();
+        let mut cursor = tree.walk();
+        let mut depth = 0i32;
+        loop {
+            let node = cursor.node();
+            if node.is_error() || node.is_missing() {
+                let start = node.start_position();
+                let end = node.end_position();
+                let text = &self.source[node.start_byte()..node.end_byte()];
+                errors.push(serde_json::json!({
+                    "kind": if node.is_error() { "ERROR" } else { "MISSING" },
+                    "start_row": start.row,
+                    "start_col": start.column,
+                    "end_row": end.row,
+                    "end_col": end.column,
+                    "text_preview": make_preview(text),
+                }));
             }
-            for i in 0..=txt.len() {
-                if text_glob_inner(rest, &txt[i..]) {
-                    return true;
+            if cursor.goto_first_child() {
+                depth += 1;
+                continue;
+            }
+            loop {
+                if cursor.goto_next_sibling() {
+                    break;
                 }
+                if depth == 0 {
+                    return errors;
+                }
+                cursor.goto_parent();
+                depth -= 1;
             }
-            false
         }
-        Some((&b'?', rest)) => match txt.split_first() {
-            Some((_, rest_t)) => text_glob_inner(rest, rest_t),
-            None => false,
-        },
-        Some((&pc, rest_p)) => match txt.split_first() {
-            Some((&tc, rest_t)) if tc == pc => text_glob_inner(rest_p, rest_t),
-            _ => false,
-        },
+    }
+    // -----------------------------------------------------------------------
+    // Helpers
+    // -----------------------------------------------------------------------
+    fn check_version(&self, expected: Option<u64>) -> anyhow::Result<()> {
+        if let Some(v) = expected {
+            if self.version != v {
+                anyhow::bail!(
+                    "conflict: file is at version {} but caller expected {} — \
+                     re-read the file and retry",
+                    self.version, v
+                );
+            }
+        }
+        Ok(())
+    }
+    fn require_node(&self, node_id: NodeId) -> anyhow::Result<tree_sitter::Node<'_>> {
+        let tree = self.tree.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("plain-text files do not have a parse tree"))?;
+        if (tree.root_node().id() as NodeId) == node_id {
+            return Ok(tree.root_node());
+        }
+        self.find_node(node_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "node_id {} not found — the file may have been edited (version {})",
+                node_id, self.version
+            )
+        })
+    }
+    fn node_to_info(&self, node: tree_sitter::Node<'_>) -> NodeInfo {
+        let start = node.start_position();
+        let end = node.end_position();
+        let text = &self.source[node.start_byte()..node.end_byte()];
+        NodeInfo {
+            node_id: node.id() as NodeId,
+            kind: node.kind().to_string(),
+            text_preview: make_preview(text),
+            start_row: start.row as u32,
+            start_col: start.column as u32,
+            end_row: end.row as u32,
+            end_col: end.column as u32,
+            start_byte: node.start_byte() as u32,
+            end_byte: node.end_byte() as u32,
+            is_named: node.is_named(),
+            has_error: node.has_error(),
+            named_child_count: node.named_child_count() as u32,
+        }
     }
 }
 // ---------------------------------------------------------------------------
-
-/// Map a `lexer::TokenKind` to the corresponding `SyntaxKind`.
-fn token_kind_to_syntax(tk: TokenKind) -> SyntaxKind {
-    match tk {
-        TokenKind::Keyword => SyntaxKind::Keyword,
-        TokenKind::Identifier => SyntaxKind::Identifier,
-        TokenKind::Literal => SyntaxKind::Literal,
-        TokenKind::Comment => SyntaxKind::Comment,
-        TokenKind::Whitespace => SyntaxKind::Whitespace,
-        TokenKind::Newline => SyntaxKind::Newline,
-        TokenKind::Punctuation => SyntaxKind::Punctuation,
+// Free helpers
+// ---------------------------------------------------------------------------
+/// Return a single-line preview of at most 80 chars from `text`.
+pub fn make_preview(text: &str) -> String {
+    let first = text.lines().next().unwrap_or("");
+    let trimmed = first.trim_end();
+    let multi = text.contains('\n') && !text.trim_end_matches('\n').is_empty()
+        && text.trim_end_matches('\n').contains('\n');
+    if trimmed.len() > 80 || multi {
+        let cut = trimmed.char_indices().nth(80).map(|(i, _)| i).unwrap_or(trimmed.len());
+        format!("{}…", &trimmed[..cut])
+    } else {
+        trimmed.to_string()
     }
 }
-
-/// Build a single rowan Line green node from raw line text.
-///
-/// Uses the language-appropriate lexer so the resulting Line node has the
-/// same token-level structure as lines built by `build_tree`.  A trailing
-/// `\n` must be included in `text` if required.
-///
-/// The builder's root is the Line node itself — callers can pass the result
-/// directly to `GreenNodeData::replace_child` / `splice_children`.
-fn build_line_node(text: &str, language: FileLanguage) -> GreenNode {
-    let mut b = GreenNodeBuilder::new();
-    let raw = |k: SyntaxKind| rowan::SyntaxKind(k as u16);
-
-    b.start_node(raw(SyntaxKind::Line));
-    match language {
-        FileLanguage::Rust => {
-            for tok in lexer::lex_rust(text) {
-                b.token(raw(token_kind_to_syntax(tok.kind)), tok.text);
-            }
-        }
-        FileLanguage::Plain => {
-            b.token(raw(SyntaxKind::Text), text);
-        }
-    }
-    b.finish_node();
-    b.finish()
+/// Splice `replacement` into `source` at byte range `[start, end)`.
+fn splice(source: &str, start: usize, end: usize, replacement: &str) -> String {
+    format!("{}{}{}", &source[..start], replacement, &source[end..])
 }
-
-/// Build a rowan green tree from raw file text.
-///
-/// When `language` is `Rust`, each Line node contains token-level children
-/// (Keyword, Identifier, …, Newline).  When `language` is `Plain`, each Line
-/// node contains a single `Text` token, producing the same line-oriented tree
-/// as Phase 1/2.
-///
-/// In both cases the tree is lossless: `to_text()` reconstructs the original
-/// content byte-for-byte.
-fn build_tree(content: &str, language: FileLanguage) -> GreenNode {
-    let mut builder = GreenNodeBuilder::new();
-    let raw = |k: SyntaxKind| rowan::SyntaxKind(k as u16);
-
-    builder.start_node(raw(SyntaxKind::Root));
-
-    match language {
-        FileLanguage::Rust => {
-            // Split into lines first; then lex each line individually.
-            // `split_inclusive('\n')` keeps the '\n' attached to its line.
-            for line in content.split_inclusive('\n') {
-                builder.start_node(raw(SyntaxKind::Line));
-                for token in lexer::lex_rust(line) {
-                    let sk = token_kind_to_syntax(token.kind);
-                    builder.token(raw(sk), token.text);
-                }
-                builder.finish_node();
-            }
-        }
-        FileLanguage::Plain => {
-            for line in content.split_inclusive('\n') {
-                builder.start_node(raw(SyntaxKind::Line));
-                builder.token(raw(SyntaxKind::Text), line);
-                builder.finish_node();
-            }
-        }
-    }
-
-    builder.finish_node();
-    builder.finish()
-}
-
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const CONTENT: &str = "fn main() {\n    println!(\"hello\");\n}\n";
-
-    fn sample_file() -> CstFile {
-        CstFile::parse(PathBuf::from("test.rs"), CONTENT)
+    fn rust_file(src: &str) -> CstFile {
+        CstFile::parse(PathBuf::from("test.rs"), src)
     }
-
-    fn plain_file() -> CstFile {
-        CstFile::parse(PathBuf::from("test.txt"), "line one\nline two\n")
+    fn js_file(src: &str) -> CstFile {
+        CstFile::parse(PathBuf::from("test.js"), src)
     }
-
-    // --- round-trip ---
-
-    #[test]
-    fn parse_roundtrip() {
-        let file = sample_file();
-        assert_eq!(file.to_text(), CONTENT);
+    fn ts_file(src: &str) -> CstFile {
+        CstFile::parse(PathBuf::from("test.ts"), src)
     }
-
-    #[test]
-    fn parse_roundtrip_plain() {
-        let file = plain_file();
-        assert_eq!(file.to_text(), "line one\nline two\n");
+    fn css_file(src: &str) -> CstFile {
+        CstFile::parse(PathBuf::from("test.css"), src)
     }
-
-    // --- version ---
-
-    #[test]
-    fn initial_version_is_zero() {
-        assert_eq!(sample_file().version, 0);
+    fn html_file(src: &str) -> CstFile {
+        CstFile::parse(PathBuf::from("test.html"), src)
     }
-
+    fn plain_file(src: &str) -> CstFile {
+        CstFile::parse(PathBuf::from("test.txt"), src)
+    }
     // --- language detection ---
-
     #[test]
     fn rs_extension_detected_as_rust() {
-        let file = CstFile::parse(PathBuf::from("a.rs"), "");
-        assert_eq!(file.language(), FileLanguage::Rust);
+        assert_eq!(rust_file("fn f() {}").language(), FileLanguage::Rust);
     }
-
+    #[test]
+    fn js_extension_detected_as_javascript() {
+        assert_eq!(js_file("const x = 1;").language(), FileLanguage::JavaScript);
+    }
+    #[test]
+    fn ts_extension_detected_as_typescript() {
+        assert_eq!(ts_file("const x: number = 1;").language(), FileLanguage::TypeScript);
+    }
+    #[test]
+    fn tsx_extension_detected_as_tsx() {
+        let f = CstFile::parse(PathBuf::from("App.tsx"), "<div/>");
+        assert_eq!(f.language(), FileLanguage::Tsx);
+    }
+    #[test]
+    fn css_extension_detected_as_css() {
+        assert_eq!(css_file("body {}").language(), FileLanguage::Css);
+    }
+    #[test]
+    fn html_extension_detected_as_html() {
+        assert_eq!(html_file("<html/>").language(), FileLanguage::Html);
+    }
     #[test]
     fn txt_extension_detected_as_plain() {
-        let file = CstFile::parse(PathBuf::from("a.txt"), "");
-        assert_eq!(file.language(), FileLanguage::Plain);
+        assert_eq!(plain_file("hello").language(), FileLanguage::Plain);
     }
-
-    // --- tree skeleton ---
-
+    // --- roundtrip ---
     #[test]
-    fn tree_skeleton_line_count() {
-        let file = sample_file();
-        let nodes = file.tree_skeleton();
-        // CONTENT has 3 lines (each ends with \n)
-        assert_eq!(nodes.len(), 3);
+    fn parse_roundtrip_rust() {
+        let src = "fn main() {\n    println!(\"hello\");\n}\n";
+        let f = rust_file(src);
+        assert_eq!(f.to_text(), src);
     }
-
     #[test]
-    fn tree_skeleton_spans_are_contiguous() {
-        let file = sample_file();
-        let nodes = file.tree_skeleton();
-        for window in nodes.windows(2) {
-            assert_eq!(window[0].span_end, window[1].span_start);
-        }
-        let last = nodes.last().unwrap();
-        assert_eq!(last.span_end as usize, CONTENT.len());
+    fn parse_roundtrip_js() {
+        let src = "const x = 1;\nfunction foo() { return x; }\n";
+        assert_eq!(js_file(src).to_text(), src);
     }
-
-    // --- get_node ---
-
     #[test]
-    fn get_node_returns_correct_line() {
-        let file = sample_file();
-        let info = file.get_node(1).unwrap();
-        assert_eq!(info.node_id, 1);
-        assert_eq!(info.kind, "Line");
-        assert_eq!(info.text, "    println!(\"hello\");\n");
+    fn parse_roundtrip_plain() {
+        let src = "hello world\n";
+        assert_eq!(plain_file(src).to_text(), src);
     }
-
+    // --- tree-sitter parse tree ---
     #[test]
-    fn get_node_out_of_range() {
-        let file = sample_file();
-        assert!(file.get_node(99).is_err());
+    fn rust_has_parse_tree() {
+        let f = rust_file("fn f() {}");
+        assert!(f.root_node_id().is_some());
     }
-
     #[test]
-    fn text_preview_strips_newline_and_truncates() {
-        let file = sample_file();
-        let info = file.get_node(0).unwrap();
-        let preview = info.text_preview();
-        assert!(!preview.ends_with('\n'));
-        assert!(preview.len() <= 80);
+    fn plain_has_no_parse_tree() {
+        let f = plain_file("hello");
+        assert!(f.root_node_id().is_none());
     }
-
-    // --- get_line_tokens ---
-
     #[test]
-    fn get_line_tokens_rust_file() {
-        let file = sample_file();
-        // Line 0 is "fn main() {\n"
-        let tokens = file.get_line_tokens(0).unwrap();
-        let kinds: Vec<&str> = tokens.iter().map(|t| t.kind).collect();
-        assert!(kinds.contains(&"Keyword"), "should contain a Keyword token");
-        assert!(kinds.contains(&"Identifier"), "should contain an Identifier token");
+    fn get_root_node_works() {
+        let f = rust_file("fn f() {}");
+        let root_id = f.root_node_id().unwrap();
+        let info = f.get_node(root_id).unwrap();
+        assert_eq!(info.node_id, root_id);
+        assert_eq!(info.kind, "source_file");
     }
-
     #[test]
-    fn get_line_tokens_lossless() {
-        let file = sample_file();
-        let tokens = file.get_line_tokens(0).unwrap();
-        let reconstructed: String = tokens.iter().map(|t| t.text.as_str()).collect();
-        assert_eq!(reconstructed, "fn main() {\n");
+    fn find_child_node_works() {
+        let f = rust_file("fn hello() {}");
+        let root_id = f.root_node_id().unwrap();
+        let children = f.get_children(root_id, true).unwrap();
+        assert!(!children.is_empty(), "source_file should have named children");
+        let fn_child = &children[0];
+        assert_eq!(fn_child.kind, "function_item");
+        let info = f.get_node(fn_child.node_id).unwrap();
+        assert_eq!(info.kind, "function_item");
     }
-
     #[test]
-    fn get_line_tokens_spans_are_within_line() {
-        let file = sample_file();
-        let line_info = file.get_node(0).unwrap();
-        let tokens = file.get_line_tokens(0).unwrap();
-        for tok in &tokens {
-            assert!(tok.span_start >= line_info.span_start);
-            assert!(tok.span_end <= line_info.span_end);
-        }
+    fn tree_skeleton_returns_hierarchical_json() {
+        let f = rust_file("fn foo() {}\nfn bar() {}\n");
+        let skeleton = f.get_tree_skeleton(None, Some(2), true).unwrap();
+        assert_eq!(skeleton["kind"], "source_file");
+        let children = skeleton["children"].as_array().unwrap();
+        assert_eq!(children.len(), 2, "two top-level function_item nodes");
+        assert_eq!(children[0]["kind"], "function_item");
     }
-
     #[test]
-    fn get_line_tokens_out_of_range() {
-        let file = sample_file();
-        assert!(file.get_line_tokens(99).is_err());
+    fn get_children_with_named_only_false_includes_punctuation() {
+        let f = rust_file("fn f() {}");
+        let root_id = f.root_node_id().unwrap();
+        let children_all = f.get_children(root_id, false).unwrap();
+        let children_named = f.get_children(root_id, true).unwrap();
+        assert!(children_all.len() >= children_named.len());
     }
-
+    // --- initial version ---
     #[test]
-    fn get_line_tokens_plain_file() {
-        let file = plain_file();
-        let tokens = file.get_line_tokens(0).unwrap();
-        // Plain grammar: one Text token + Newline
-        assert!(!tokens.is_empty());
-        let text: String = tokens.iter().map(|t| t.text.as_str()).collect();
-        assert_eq!(text, "line one\n");
+    fn initial_version_is_zero() {
+        assert_eq!(rust_file("fn f() {}").version, 0);
     }
-
     // --- replace_node ---
-
     #[test]
     fn replace_node_increments_version() {
-        let file = sample_file();
-        let updated = file.replace_node(1, "    println!(\"world\");").unwrap();
-        assert_eq!(updated.version, 1);
+        let f = rust_file("fn foo() {}\n");
+        let root_id = f.root_node_id().unwrap();
+        let fn_child_id = f.get_children(root_id, true).unwrap()[0].node_id;
+        let f2 = f.replace_node(fn_child_id, "fn bar() {}\n", None).unwrap();
+        assert_eq!(f2.version, 1);
     }
-
     #[test]
-    fn replace_node_preserves_other_lines() {
-        let file = sample_file();
-        let updated = file.replace_node(1, "    println!(\"world\");").unwrap();
-        let text = updated.to_text();
-        assert!(text.starts_with("fn main() {\n"));
-        assert!(text.contains("println!(\"world\");"));
-        assert!(text.ends_with("}\n"));
+    fn replace_node_changes_text() {
+        let f = rust_file("fn foo() {}\n");
+        let root_id = f.root_node_id().unwrap();
+        let fn_child_id = f.get_children(root_id, true).unwrap()[0].node_id;
+        let f2 = f.replace_node(fn_child_id, "fn bar() {}\n", None).unwrap();
+        assert!(f2.to_text().contains("bar"));
+        assert!(!f2.to_text().contains("foo"));
     }
-
     #[test]
-    fn replace_node_out_of_range() {
-        let file = sample_file();
-        assert!(file.replace_node(99, "x").is_err());
+    fn replace_node_conflict_detection() {
+        let f = rust_file("fn f() {}\n");
+        let root_id = f.root_node_id().unwrap();
+        let fn_id = f.get_children(root_id, true).unwrap()[0].node_id;
+        let result = f.replace_node(fn_id, "fn g() {}\n", Some(99));
+        assert!(result.is_err());
+        assert!(result.err().unwrap().to_string().contains("conflict"));
     }
-
+    // --- insert_before_node / insert_after_node ---
     #[test]
-    fn replace_node_preserves_language() {
-        let file = sample_file();
-        let updated = file.replace_node(0, "fn foo() {").unwrap();
-        assert_eq!(updated.language(), FileLanguage::Rust);
-        // Token-level structure preserved after edit.
-        let tokens = updated.get_line_tokens(0).unwrap();
-        assert!(tokens.iter().any(|t| t.kind == "Keyword" && t.text == "fn"));
+    fn insert_before_node_prepends_text() {
+        let f = rust_file("fn foo() {}\n");
+        let root_id = f.root_node_id().unwrap();
+        let fn_id = f.get_children(root_id, true).unwrap()[0].node_id;
+        let f2 = f.insert_before_node(fn_id, "// comment\n", None).unwrap();
+        assert!(f2.to_text().starts_with("// comment\nfn foo()"));
+        assert_eq!(f2.version, 1);
     }
-
-    // --- empty file ---
-
     #[test]
-    fn empty_file_produces_no_line_nodes() {
-        let file = CstFile::parse(PathBuf::from("empty.rs"), "");
-        assert_eq!(file.tree_skeleton().len(), 0);
+    fn insert_after_node_appends_text() {
+        let f = rust_file("fn foo() {}\n");
+        let root_id = f.root_node_id().unwrap();
+        let fn_id = f.get_children(root_id, true).unwrap()[0].node_id;
+        let f2 = f.insert_after_node(fn_id, "\nfn bar() {}\n", None).unwrap();
+        assert!(f2.to_text().contains("fn bar()"));
     }
-
-    // --- insert_lines ---
-
+    // --- delete_node ---
     #[test]
-    fn insert_lines_at_beginning() {
-        let file = sample_file();
-        let inserted = file
-            .insert_lines(None, &["// new first line\n".to_owned()])
-            .unwrap();
-        assert_eq!(inserted.version, 1);
-        assert_eq!(inserted.tree_skeleton().len(), 4);
-        assert_eq!(inserted.get_node(0).unwrap().text, "// new first line\n");
-        // Original lines shifted down by one.
-        assert_eq!(inserted.get_node(1).unwrap().text, "fn main() {\n");
+    fn delete_node_removes_text() {
+        let f = rust_file("fn foo() {}\nfn bar() {}\n");
+        let root_id = f.root_node_id().unwrap();
+        let children = f.get_children(root_id, true).unwrap();
+        assert_eq!(children.len(), 2);
+        let foo_id = children[0].node_id;
+        let f2 = f.delete_node(foo_id, None).unwrap();
+        assert!(!f2.to_text().contains("foo"));
+        assert!(f2.to_text().contains("bar"));
+        assert_eq!(f2.version, 1);
     }
-
-    #[test]
-    fn insert_lines_after_last() {
-        let file = sample_file(); // 3 lines, last idx = 2
-        let inserted = file
-            .insert_lines(Some(2), &["// appended\n".to_owned()])
-            .unwrap();
-        assert_eq!(inserted.tree_skeleton().len(), 4);
-        assert_eq!(inserted.get_node(3).unwrap().text, "// appended\n");
-    }
-
-    #[test]
-    fn insert_lines_in_middle() {
-        let file = sample_file(); // lines: 0=fn, 1=println, 2=}
-        let inserted = file
-            .insert_lines(Some(0), &["    // inserted\n".to_owned()])
-            .unwrap();
-        assert_eq!(inserted.tree_skeleton().len(), 4);
-        assert_eq!(inserted.get_node(0).unwrap().text, "fn main() {\n");
-        assert_eq!(inserted.get_node(1).unwrap().text, "    // inserted\n");
-        assert_eq!(inserted.get_node(2).unwrap().text, "    println!(\"hello\");\n");
-    }
-
-    #[test]
-    fn insert_lines_auto_appends_newline() {
-        let file = sample_file();
-        // Text without trailing \n → server must add one.
-        let inserted = file
-            .insert_lines(None, &["// no newline".to_owned()])
-            .unwrap();
-        assert!(
-            inserted.get_node(0).unwrap().text.ends_with('\n'),
-            "inserted line must end with \\n"
-        );
-    }
-
-    #[test]
-    fn insert_lines_multiple() {
-        let file = sample_file();
-        let lines = vec!["// a\n".to_owned(), "// b\n".to_owned()];
-        let inserted = file.insert_lines(Some(0), &lines).unwrap();
-        assert_eq!(inserted.tree_skeleton().len(), 5);
-        assert_eq!(inserted.get_node(1).unwrap().text, "// a\n");
-        assert_eq!(inserted.get_node(2).unwrap().text, "// b\n");
-    }
-
-    #[test]
-    fn insert_lines_roundtrip() {
-        let file = sample_file();
-        let lines = vec!["    let z = 99;\n".to_owned()];
-        let inserted = file.insert_lines(Some(0), &lines).unwrap();
-        let text = inserted.to_text();
-        assert_eq!(
-            text,
-            "fn main() {\n    let z = 99;\n    println!(\"hello\");\n}\n"
-        );
-    }
-
-    #[test]
-    fn insert_lines_out_of_range() {
-        let file = sample_file();
-        assert!(file.insert_lines(Some(99), &["x\n".to_owned()]).is_err());
-    }
-
-    #[test]
-    fn insert_lines_empty_input() {
-        let file = sample_file();
-        assert!(file.insert_lines(None, &[]).is_err());
-    }
-
-    #[test]
-    fn insert_lines_preserves_language() {
-        let file = sample_file();
-        let inserted = file
-            .insert_lines(Some(0), &["    let y = 2;\n".to_owned()])
-            .unwrap();
-        assert_eq!(inserted.language(), FileLanguage::Rust);
-        let tokens = inserted.get_line_tokens(1).unwrap();
-        assert!(tokens.iter().any(|t| t.kind == "Keyword" && t.text == "let"));
-    }
-
-    // --- delete_lines ---
-
-    #[test]
-    fn delete_single_line() {
-        let file = sample_file(); // lines: fn / println / }
-        let deleted = file.delete_lines(1, 1).unwrap();
-        assert_eq!(deleted.version, 1);
-        assert_eq!(deleted.tree_skeleton().len(), 2);
-        assert_eq!(deleted.get_node(0).unwrap().text, "fn main() {\n");
-        assert_eq!(deleted.get_node(1).unwrap().text, "}\n");
-    }
-
-    #[test]
-    fn delete_first_line() {
-        let file = sample_file();
-        let deleted = file.delete_lines(0, 1).unwrap();
-        assert_eq!(deleted.tree_skeleton().len(), 2);
-        assert_eq!(deleted.get_node(0).unwrap().text, "    println!(\"hello\");\n");
-    }
-
-    #[test]
-    fn delete_last_line() {
-        let file = sample_file();
-        let deleted = file.delete_lines(2, 1).unwrap();
-        assert_eq!(deleted.tree_skeleton().len(), 2);
-        assert_eq!(deleted.get_node(1).unwrap().text, "    println!(\"hello\");\n");
-    }
-
-    #[test]
-    fn delete_all_lines() {
-        let file = sample_file();
-        let deleted = file.delete_lines(0, 3).unwrap();
-        assert_eq!(deleted.tree_skeleton().len(), 0);
-        assert_eq!(deleted.to_text(), "");
-    }
-
-    #[test]
-    fn delete_multiple_lines_roundtrip() {
-        // File: fn / println / } — delete lines 0 and 1 (keep only })
-        let file = sample_file();
-        let deleted = file.delete_lines(0, 2).unwrap();
-        assert_eq!(deleted.to_text(), "}\n");
-    }
-
-    #[test]
-    fn delete_lines_out_of_range_start() {
-        let file = sample_file();
-        assert!(file.delete_lines(99, 1).is_err());
-    }
-
-    #[test]
-    fn delete_lines_exceeds_length() {
-        let file = sample_file(); // 3 lines, start at 2 with count 2 → end index 4 > 3
-        assert!(file.delete_lines(2, 2).is_err());
-    }
-
-    #[test]
-    fn delete_lines_zero_count() {
-        let file = sample_file();
-        assert!(file.delete_lines(0, 0).is_err());
-    }
-
-    #[test]
-    fn delete_preserves_language() {
-        let file = sample_file();
-        let deleted = file.delete_lines(1, 1).unwrap();
-        assert_eq!(deleted.language(), FileLanguage::Rust);
-    }
-
-    // --- surgical rebuild correctness ---
-
-    #[test]
-    fn replace_node_is_surgical_lossless() {
-        let file = sample_file();
-        let updated = file.replace_node(1, "    let x = 42;").unwrap();
-        // Verify full round-trip text.
-        assert_eq!(
-            updated.to_text(),
-            "fn main() {\n    let x = 42;\n}\n"
-        );
-        // Verify token kinds on edited line.
-        let tokens = updated.get_line_tokens(1).unwrap();
-        assert!(tokens.iter().any(|t| t.kind == "Keyword" && t.text == "let"));
-    }
-
+    // --- successive mutations ---
     #[test]
     fn successive_mutations_increment_version() {
-        let file = sample_file();
-        let v1 = file.replace_node(0, "fn foo() {").unwrap();
-        let v2 = v1
-            .insert_lines(Some(0), &["    // comment\n".to_owned()])
+        let f = rust_file("fn a() {}\nfn b() {}\n");
+        let root_id = f.root_node_id().unwrap();
+        let children = f.get_children(root_id, true).unwrap();
+        let id0 = children[0].node_id;
+        let f1 = f.replace_node(id0, "fn aa() {}\n", None).unwrap();
+        assert_eq!(f1.version, 1);
+        // After edit, tree is re-parsed; must re-query IDs.
+        let root_id2 = f1.root_node_id().unwrap();
+        let children2 = f1.get_children(root_id2, true).unwrap();
+        let id1 = children2[1].node_id;
+        let f2 = f1.replace_node(id1, "fn bb() {}\n", None).unwrap();
+        assert_eq!(f2.version, 2);
+    }
+    // --- query_ts ---
+    #[test]
+    fn query_ts_finds_function_names() {
+        let f = rust_file("fn alpha() {}\nfn beta() {}\n");
+        let matches = f
+            .query_ts("(function_item name: (identifier) @fn_name)", None)
             .unwrap();
-        let v3 = v2.delete_lines(2, 1).unwrap();
-        assert_eq!(file.version, 0);
-        assert_eq!(v1.version, 1);
-        assert_eq!(v2.version, 2);
-        assert_eq!(v3.version, 3);
+        let names: Vec<&str> = matches.iter().map(|m| m.text_preview.as_str()).collect();
+        assert!(names.contains(&"alpha"), "should find 'alpha'");
+        assert!(names.contains(&"beta"), "should find 'beta'");
     }
-
-    // ── query: basic text / kind filters ────────────────────────────────────
-
-    fn no_filter() -> QueryExpr {
-        QueryExpr {
-            kind: None,
-            text_contains: None,
-            text_glob: None,
-            node_id_from: None,
-            node_id_to: None,
-            depth: None,
-            semantic: None,
-            identifier_name: None,
-            scope_depth_min: None,
-            scope_depth_max: None,
-        }
-    }
-
     #[test]
-    fn query_no_filter_returns_all_lines() {
-        let file = sample_file();
-        let matches = file.query(&no_filter());
-        // CONTENT has 3 lines
-        assert_eq!(matches.len(), 3);
-        assert!(matches.iter().all(|m| m.kind == "Line"));
+    fn query_ts_respects_max_matches() {
+        let f = rust_file("fn a() {}\nfn b() {}\nfn c() {}\n");
+        let matches = f
+            .query_ts("(function_item name: (identifier) @n)", Some(2))
+            .unwrap();
+        assert!(matches.len() <= 2);
     }
-
     #[test]
-    fn query_line_by_text_contains() {
-        let file = sample_file();
-        let expr = QueryExpr {
-            text_contains: Some("println".to_owned()),
-            ..no_filter()
-        };
-        let matches = file.query(&expr);
-        assert_eq!(matches.len(), 1);
-        assert!(matches[0].text.contains("println"));
+    fn query_ts_js_finds_const_declarations() {
+        let f = js_file("const x = 1;\nconst y = 2;\n");
+        let matches = f
+            .query_ts("(lexical_declaration (variable_declarator name: (identifier) @name))", None)
+            .unwrap();
+        let names: Vec<&str> = matches.iter().map(|m| m.text_preview.as_str()).collect();
+        assert!(names.contains(&"x"), "should find 'x'");
+        assert!(names.contains(&"y"), "should find 'y'");
     }
-
+    // --- get_errors ---
     #[test]
-    fn query_line_by_text_glob() {
-        let file = sample_file();
-        let expr = QueryExpr {
-            text_glob: Some("fn *".to_owned()),
-            ..no_filter()
-        };
-        let matches = file.query(&expr);
-        assert_eq!(matches.len(), 1);
-        assert!(matches[0].text.starts_with("fn "));
+    fn get_errors_empty_for_valid_code() {
+        let f = rust_file("fn f() {}\n");
+        assert!(f.get_errors().is_empty());
     }
-
     #[test]
-    fn query_line_by_node_id_range() {
-        let file = sample_file();
-        let expr = QueryExpr {
-            node_id_from: Some(1),
-            node_id_to: Some(1),
-            ..no_filter()
-        };
-        let matches = file.query(&expr);
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].node_id, 1);
+    fn get_errors_does_not_panic_on_invalid_code() {
+        let f = rust_file("fn broken( {\n");
+        let _ = f.get_errors(); // must not panic
     }
-
+    // --- make_preview ---
     #[test]
-    fn query_no_matches_returns_empty() {
-        let file = sample_file();
-        let expr = QueryExpr {
-            text_contains: Some("XYZNOTHERE".to_owned()),
-            ..no_filter()
-        };
-        assert!(file.query(&expr).is_empty());
+    fn preview_truncates_at_80_chars() {
+        let long = "a".repeat(100);
+        let p = make_preview(&long);
+        assert!(p.ends_with('…'));
     }
-
-    // ── query: token-depth ───────────────────────────────────────────────────
-
     #[test]
-    fn query_token_by_kind_keyword() {
-        let file = sample_file();
-        let expr = QueryExpr {
-            depth: Some("token".to_owned()),
-            kind: Some("Keyword".to_owned()),
-            ..no_filter()
-        };
-        let matches = file.query(&expr);
-        // "fn main() {\n" contains `fn`; body contains none; "}" contains none
-        assert!(!matches.is_empty());
-        assert!(matches.iter().all(|m| m.kind == "Keyword"));
-        assert!(matches.iter().all(|m| m.token_idx.is_some()));
-    }
-
-    #[test]
-    fn query_identifier_name() {
-        let file = sample_file();
-        let expr = QueryExpr {
-            identifier_name: Some("main".to_owned()),
-            ..no_filter()
-        };
-        let matches = file.query(&expr);
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].text, "main");
-        assert_eq!(matches[0].kind, "Identifier");
-        assert_eq!(matches[0].node_id, 0); // on first line
-    }
-
-    // ── query: semantic patterns ─────────────────────────────────────────────
-
-    #[test]
-    fn query_semantic_fn_def() {
-        let file = sample_file();
-        let expr = QueryExpr {
-            semantic: Some("fn_def".to_owned()),
-            ..no_filter()
-        };
-        let matches = file.query(&expr);
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].capture.as_deref(), Some("main"));
-        assert_eq!(matches[0].node_id, 0);
-    }
-
-    #[test]
-    fn query_semantic_macro_call() {
-        let file = sample_file();
-        let expr = QueryExpr {
-            semantic: Some("macro_call".to_owned()),
-            ..no_filter()
-        };
-        let matches = file.query(&expr);
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].capture.as_deref(), Some("println"));
-    }
-
-    #[test]
-    fn query_semantic_variable_def() {
-        let src = "fn f() {\n    let mut x = 1;\n    const Y: u32 = 2;\n    static Z: i32 = 0;\n}\n";
-        let file = CstFile::parse(PathBuf::from("v.rs"), src);
-        let expr = QueryExpr {
-            semantic: Some("variable_def".to_owned()),
-            ..no_filter()
-        };
-        let matches = file.query(&expr);
-        assert_eq!(matches.len(), 3);
-        let names: Vec<_> = matches.iter().map(|m| m.capture.as_deref().unwrap()).collect();
-        assert!(names.contains(&"x"));
-        assert!(names.contains(&"Y"));
-        assert!(names.contains(&"Z"));
-    }
-
-    // ── query: scope depth ───────────────────────────────────────────────────
-
-    #[test]
-    fn query_scope_depth_top_level_only() {
-        let file = sample_file();
-        // Only matches lines at brace depth 0 (top-level).
-        let expr = QueryExpr {
-            scope_depth_max: Some(0),
-            ..no_filter()
-        };
-        let matches = file.query(&expr);
-        // Line 0: "fn main() {\n" is at depth 0 ✓
-        // Line 1: "    println!...\n" is at depth 1 ✗
-        // Line 2: "}\n" is at depth 1 at its start ✗ (depth increases after `{`)
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].node_id, 0);
-    }
-
-    #[test]
-    fn query_scope_depth_inside_block() {
-        let file = sample_file();
-        // Only matches lines inside at least one block.
-        let expr = QueryExpr {
-            scope_depth_min: Some(1),
-            ..no_filter()
-        };
-        let matches = file.query(&expr);
-        // Lines 1 and 2 are at depth ≥ 1.
-        assert_eq!(matches.len(), 2);
-    }
-
-    #[test]
-    fn query_semantic_fn_def_at_top_level_only() {
-        // Two functions: one top-level, one nested (unusual but valid Rust).
-        let src = "fn outer() {\n    fn inner() {}\n}\n";
-        let file = CstFile::parse(PathBuf::from("nested.rs"), src);
-        let expr = QueryExpr {
-            semantic: Some("fn_def".to_owned()),
-            scope_depth_max: Some(0),
-            ..no_filter()
-        };
-        let matches = file.query(&expr);
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].capture.as_deref(), Some("outer"));
+    fn preview_takes_first_line_only() {
+        let p = make_preview("first line\nsecond line");
+        assert!(!p.contains("second"));
     }
 }

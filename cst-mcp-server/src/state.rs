@@ -116,7 +116,11 @@ mod tests {
         let (path, file) = make_file("e.rs", "line1\nline2\n");
         state.track(path.clone(), file);
 
-        let updated = state.get(&path).unwrap().replace_node(0, "replaced").unwrap();
+        let updated = {
+            let f = state.get(&path).unwrap();
+            let root_id = f.root_node_id().unwrap();
+            f.replace_node(root_id, "fn a() {}\nfn b() {}\n", None).unwrap()
+        };
         assert_eq!(updated.version, 1);
         state.track(path.clone(), updated);
 
