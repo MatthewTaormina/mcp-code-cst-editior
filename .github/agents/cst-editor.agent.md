@@ -24,6 +24,7 @@ The server uses **tree-sitter** as its parse backend. Every file is parsed into 
 | `get_tree_skeleton(path, node_id?, max_depth?, named_only?)` | Hierarchical JSON of the parse tree. Omit `node_id` for file root. `named_only=true` hides punctuation. |
 | `get_node(path, node_id)` | Full metadata for one node: kind, text_preview, row/col, byte offsets, child count. |
 | `get_children(path, node_id, named_only?)` | Direct children with field names (`name`, `body`, `parameters`, …). |
+| `get_lines(path, start?, end?)` | Read lines with 1-based numbers. Works for all files; **required** for `Plain` files that have no CST. |
 
 ### Query
 | Tool | Purpose |
@@ -44,6 +45,33 @@ All edit tools return `{version, has_errors, errors:[…]}`. **Node IDs are stal
 | `insert_into(path, node_id, text, position?, expected_version?)` | Insert inside a node at `"start"` or `"end"` (default `"end"`). Use for adding statements to a block body. |
 | `delete_node(path, node_id, expected_version?)` | Delete a node's entire source span. |
 | `save_file(path)` | Flush in-memory CST back to disk. |
+
+### Plain-text Line Editing
+For `Plain` files (`.txt`, `.env`, config files, etc.) that have no parse tree, use these line tools. **Do not use line tools on parsed-language files.**
+
+| Tool | Purpose |
+|------|---------|
+| `edit_line(path, line, new_text, expected_version?)` | Replace a single line (1-based). |
+| `insert_line(path, line, text, after?, expected_version?)` | Insert a new line before (`after=false`, default) or after (`after=true`) a reference line. |
+| `delete_line(path, line, expected_version?)` | Delete a line (1-based). |
+
+Line-edit tools return `{version}`.
+
+## Parsed Languages
+
+The server parses these extensions into a full CST — use `get_tree_skeleton` / `edit_node` / etc.:
+
+| Extension(s) | Language |
+|---|---|
+| `.rs` | Rust |
+| `.js` `.jsx` `.mjs` `.cjs` | JavaScript |
+| `.ts` | TypeScript |
+| `.tsx` | TSX |
+| `.css` `.scss` `.sass` `.less` | CSS |
+| `.html` `.htm` `.svg` | HTML |
+| `.json` `.jsonc` | **JSON** |
+| `.md` `.markdown` `.mdx` | **Markdown** |
+| everything else | Plain (no CST — use line tools) |
 
 ### File Management
 | Tool | Purpose |

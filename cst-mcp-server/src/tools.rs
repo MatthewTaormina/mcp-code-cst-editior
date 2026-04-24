@@ -93,6 +93,8 @@ pub struct ListTrackedFilesParams {}
 pub struct CreateFileParams {
     pub path: String,
     pub track: Option<bool>,
+    /// Optional initial file content. Defaults to empty.
+    pub content: Option<String>,
 }
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DeleteFileParams {
@@ -272,10 +274,10 @@ impl CstMcpServer {
         serde_json::json!({ "count": files.len(), "files": files }).to_string()
     }
     // --- File management ---
-    #[tool(description = "Create a new empty file on disk. Set track=true to immediately load it. Returns ok or error.")]
+    #[tool(description = "Create a new file on disk with optional initial content. Set track=true to immediately load it. Returns ok or error.")]
     async fn create_file(
         &self,
-        Parameters(CreateFileParams { path, track }): Parameters<CreateFileParams>,
+        Parameters(CreateFileParams { path, track, content }): Parameters<CreateFileParams>,
     ) -> String {
         let resolved = match self.access.resolve_and_check("create", &path) {
             Err(e) => return format!("error: {e}"),
@@ -291,21 +293,22 @@ impl CstMcpServer {
                 }
             }
         }
-        if let Err(e) = std::fs::write(&resolved, b"") {
+        let initial = content.unwrap_or_default();
+        if let Err(e) = std::fs::write(&resolved, initial.as_bytes()) {
             return format!("error: could not write {resolved:?}: {e}");
         }
-        let mut msg = format!("ok: created {resolved:?}");
+        let mut msg = format!("ok: created {resolved:?} ({} bytes)", initial.len());
         if track.unwrap_or(false) {
-            match std::fs::read_to_string(&resolved) {
-                Err(e) => msg.push_str(&format!("; warning: track failed: {e}")),
-                Ok(text) => {
-                    let file = CstFile::parse(resolved.clone(), &text);
-                    self.state.write().await.track(resolved.clone(), file);
-                    if let Err(e) = watch_path(&self.watcher, &resolved) {
-                        eprintln!("watcher: {e}");
-                    }
-                    msg.push_str("; tracking");
-                }
+            let file = CstFile::parse(resolved.clone(), &initial);
+            let lang = format!("{:?}", file.language());
+            let root_id = file.root_node_id();
+            self.state.write().await.track(resolved.clone(), file);
+            if let Err(e) = watch_path(&self.watcher, &resolved) {
+                eprintln!("watcher: {e}");
+            }
+            match root_id {
+                Some(id) => msg.push_str(&format!("; tracking ({lang}, root node_id={id})")),
+                None => msg.push_str(&format!("; tracking ({lang}, no parse tree)")),
             }
         }
         msg
